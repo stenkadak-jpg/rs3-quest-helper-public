@@ -1,0 +1,15 @@
+{
+	"appName": "Tile Marker",
+	"description": "A tile-shaped marker that follows your mouse over the game window.",
+	"appUrl": "./tile.html",
+	"configUrl": "./appconfig-tile.json",
+	"iconUrl": "./icon-tile.png",
+	"defaultWidth": 260,
+	"defaultHeight": 320,
+	"minWidth": 220,
+	"minHeight": 260,
+	"maxWidth": 400,
+	"maxHeight": 500,
+	"permissions": "pixel,gamestate,overlay",
+	"activators": []
+}

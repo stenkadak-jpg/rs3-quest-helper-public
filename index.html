@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>RS3 Quest Helper</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<div id="alt1-banner" class="banner hidden">
+		Not running inside Alt1.
+		<a id="addtoalt1" href="#">Click here to add this app to Alt1</a>
+	</div>
+
+	<!-- Home view: searchable quest index -->
+	<div id="view-home" class="view">
+		<header>
+			<input id="search" type="search" placeholder="Search quests&hellip;" autocomplete="off">
+			<button id="btn-settings-home" title="Settings">&#9881;</button>
+		</header>
+		<div class="home-tools">
+			<input id="rsn" type="text" placeholder="RuneScape name" autocomplete="off" title="Your in-game name, used to fetch quest completion from RuneMetrics">
+			<button id="btn-sync" title="Fetch your quest statuses from RuneMetrics (profile must not be private)">Sync</button>
+			<label title="Hide quests you have completed in game"><input type="checkbox" id="hide-done"> Hide done</label>
+			<label title="Only quests you meet the requirements for and have not finished. Uses RuneMetrics, so sync your name first."><input type="checkbox" id="eligible-only"> Can do now</label>
+			<select id="sort-mode" title="Sort order">
+				<option value="az">A&ndash;Z</option>
+				<option value="optimal">Optimal order</option>
+				<option value="timeline">Timeline</option>
+			</select>
+		</div>
+		<div id="sync-status" class="status hidden"></div>
+		<div id="rm-import" class="rm-import hidden">
+			<div>
+				<a id="rm-open" href="#" target="_blank">1. Open your RuneMetrics data</a>
+				<span> — copy the whole page (Ctrl+A, Ctrl+C), paste it below, then Import.</span>
+			</div>
+			<textarea id="rm-json" rows="3" placeholder='Paste the {"quests":[...]} text here'></textarea>
+			<div class="rm-import-row">
+				<button id="btn-rm-import">2. Import</button>
+				<button id="btn-rm-cancel">Cancel</button>
+			</div>
+		</div>
+		<div id="index-status" class="status hidden"></div>
+		<main id="quest-list"></main>
+	</div>
+
+	<!-- Guide view: steps for the selected quest -->
+	<div id="view-guide" class="view hidden">
+		<header>
+			<button id="btn-home" title="Back to quest list">&#9664;</button>
+			<div id="guide-title" class="guide-title"></div>
+			<div class="progress-wrap">
+				<div class="progress-bar"><div id="progress-fill"></div></div>
+				<span id="progress-label"></span>
+			</div>
+			<button id="btn-overview-visibility" title="Hide or show the requirements overview">Hide overview</button>
+		</header>
+		<section id="quest-meta" class="quest-meta">
+			<div class="meta-top">
+				<div id="quest-info"></div>
+				<button id="btn-overview" class="overview-toggle" title="Collapse or expand the whole overview at once">Collapse overview</button>
+			</div>
+			<details id="items-panel" class="hidden" open>
+				<summary>Items needed</summary>
+				<ul id="items-list"></ul>
+				<ul id="scan-list"></ul>
+				<div class="scan-row">
+					<button id="btn-scan" title="Look for each item's icon on the game screen (open your backpack first)">Scan backpack</button>
+					<span id="scan-status"></span>
+				</div>
+			</details>
+			<details id="details-items-panel" class="details-block hidden" open>
+				<summary>From the quest page</summary>
+				<ul id="details-items"></ul>
+			</details>
+			<details id="details-rec-panel" class="details-block hidden" open>
+				<summary>Recommended</summary>
+				<ul id="details-rec"></ul>
+			</details>
+		</section>
+		<div id="guide-status" class="status hidden"></div>
+		<main id="steps"></main>
+		<div id="map-panel" class="map-panel hidden">
+			<div class="map-bar">
+				<span id="map-label"></span>
+				<a id="map-external" target="_blank">Open in browser</a>
+				<button id="map-close" title="Close map">&#10005;</button>
+			</div>
+			<iframe id="map-frame" src="about:blank" title="World map"></iframe>
+		</div>
+		<div id="free-pos" class="free-pos hidden">
+			<div id="free-pos-box" class="free-pos-box" title="Click or drag to place the overlay on the game screen">
+				<div id="free-pos-dot"></div>
+			</div>
+			<span>Click or drag inside the box to place the overlay. It stays locked there until you move it again.</span>
+		</div>
+		<div id="assist-status" class="assist-status hidden"></div>
+		<footer>
+			<button id="btn-back" title="Un-complete the previous step">&#9664; Back</button>
+			<button id="btn-next" class="primary" title="Complete the current step. While playing (game focused), press Alt1's app hotkey — Alt+1 by default — to do this without clicking.">Done, next &#9654;</button>
+			<button id="btn-assist" title="Highlight matching dialogue options in game and watch the chatbox">Assist: off</button>
+			<button id="btn-auto" title="Automatically tick dialogue steps when the conversation ends (needs Assist)">Auto: off</button>
+			<button id="btn-overlay" title="Show the current step on top of the game screen">Overlay: off</button>
+			<select id="overlay-pos" title="Where the overlay card appears on the game screen">
+				<option value="tc">Top</option>
+				<option value="tl">Top-left</option>
+				<option value="tr">Top-right</option>
+				<option value="bc">Bottom</option>
+				<option value="free">Free…</option>
+			</select>
+			<button id="btn-complete" title="Mark every step complete when you finished outside the helper">Mark complete</button>
+			<button id="btn-settings-guide" title="Settings">&#9881;</button>
+			<button id="btn-reset" title="Clear all progress for this quest">Reset</button>
+		</footer>
+	</div>
+
+	<div id="settings-popup" class="item-popup hidden">
+		<div class="item-popup-card">
+			<div class="item-popup-head">
+				<span id="settings-title">Settings</span>
+				<button id="settings-close" title="Close">&#10005;</button>
+			</div>
+			<div class="settings-row">
+				<label for="floor-mode" title="UK counts the ground floor separately; US calls it the 1st floor">Floor numbering</label>
+				<select id="floor-mode">
+					<option value="uk">UK (ground, 1st, 2nd&hellip;)</option>
+					<option value="us">US (1st, 2nd, 3rd&hellip;)</option>
+				</select>
+			</div>
+			<div class="settings-row">
+				<label for="theme-mode">Theme</label>
+				<select id="theme-mode">
+					<option value="dark">RS dark</option>
+					<option value="light">Parchment light</option>
+					<option value="black">Pure black</option>
+				</select>
+			</div>
+			<div class="settings-row">
+				<label for="overlay-bg">Overlay background</label>
+				<select id="overlay-bg" title="Alt1 cannot blend a partly see-through card with the game, so this is all or nothing">
+					<option value="solid">Solid card</option>
+					<option value="off">Off (text only)</option>
+				</select>
+			</div>
+			<div class="settings-note">Alt1 draws the overlay onto the game and can&rsquo;t blend a half-transparent card with it, so the background is either solid or off. With it off, only the step text and border are drawn and you see the game behind them.</div>
+			<div class="settings-row">
+				<label for="overlay-size">Overlay text size</label>
+				<input id="overlay-size" type="range" min="100" max="200" step="10" title="Make the on-screen overlay card bigger — helps when the game is at a high resolution and it looks tiny">
+				<span id="overlay-size-value">100%</span>
+			</div>
+			<div class="settings-row">
+				<label for="app-size">App text size</label>
+				<input id="app-size" type="range" min="80" max="160" step="10" title="Scale all text in the app window (quest list, overview and guide)">
+				<span id="app-size-value">100%</span>
+			</div>
+			<div class="settings-note"><strong>While playing the game, press Alt+1</strong> (Alt1&rsquo;s app hotkey) to complete the current step without clicking. That is the only key that works while the game window is focused, and you can change it in Alt1&rsquo;s own settings.</div>
+			<div class="settings-row">
+				<label title="Quest list, guides and sort orders are cached for 7 days">Wiki data cache</label>
+				<button id="btn-clear-cache">Clear &amp; reload</button>
+			</div>
+			<div class="settings-note">Guides and quest lists refresh from the wiki automatically every 7 days &mdash; clear the cache to force it now. Your quest progress and settings are kept.</div>
+
+			<div class="settings-row">
+				<label title="Move your ticked steps and items to another browser or device">Progress sync</label>
+				<button id="btn-progress-export" title="Create a code with all your ticked steps and items">Export code</button>
+			</div>
+			<textarea id="progress-code" class="settings-code" rows="2" placeholder="Click Export to get your code, or paste a code here and click Import" autocomplete="off" spellcheck="false"></textarea>
+			<div class="settings-row settings-row-end">
+				<button id="btn-progress-import">Import</button>
+			</div>
+			<div id="progress-sync-status" class="settings-note">Export copies a code for all your quest progress. On another browser or device, paste it here and Import &mdash; it adds the ticked steps, it never un-ticks anything.</div>
+		</div>
+	</div>
+
+	<div id="item-popup" class="item-popup hidden">
+		<div class="item-popup-card">
+			<div class="item-popup-head">
+				<span id="item-popup-title"></span>
+				<a id="item-popup-link" target="_blank">Full wiki page</a>
+				<button id="item-popup-close" title="Close">&#10005;</button>
+			</div>
+			<div id="item-popup-body"></div>
+		</div>
+	</div>
+
+	<script src="libs/a1lib.js"></script>
+	<script src="libs/ocr.js"></script>
+	<script src="libs/dialog_rs3qh_frame_v2.js"></script>
+	<script src="libs/chatbox.js"></script>
+	<script src="libs/font_digits.js"></script>
+	<script src="app.js?v=20261025queue5"></script>
+</body>
+</html>

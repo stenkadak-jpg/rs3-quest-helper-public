@@ -1,0 +1,15 @@
+{
+	"appName": "RS3 Quest Helper",
+	"description": "Step-by-step quest quick guides with progress tracking and on-screen step overlay.",
+	"appUrl": "./index.html",
+	"configUrl": "./appconfig.json",
+	"iconUrl": "./icon.png",
+	"defaultWidth": 400,
+	"defaultHeight": 600,
+	"minWidth": 300,
+	"minHeight": 350,
+	"maxWidth": 800,
+	"maxHeight": 1200,
+	"permissions": "pixel,overlay",
+	"activators": []
+}

@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Tile Marker</title>
+	<link rel="stylesheet" href="style.css">
+	<style>
+		body { padding: 10px; gap: 10px; }
+		.row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+		.row label { min-width: 52px; color: var(--muted); }
+		input[type=range] { flex: 1; accent-color: var(--gold); }
+		.swatches { display: flex; gap: 6px; }
+		.swatch {
+			width: 22px; height: 22px; border-radius: 3px; cursor: pointer;
+			border: 2px solid transparent;
+		}
+		.swatch.sel { border-color: var(--text); }
+		#toggle { width: 100%; flex: 0 0 auto; padding: 10px; font-size: 14px; }
+		.note { font-size: 11px; color: var(--muted); line-height: 1.4; }
+		#val-size, #val-width { min-width: 30px; text-align: right; color: var(--text); }
+	</style>
+</head>
+<body>
+	<button id="toggle" class="primary">Marker: off</button>
+
+	<div class="row">
+		<label for="size">Size</label>
+		<input id="size" type="range" min="24" max="220" value="96">
+		<span id="val-size">96</span>
+	</div>
+	<div class="row">
+		<label for="linewidth">Line</label>
+		<input id="linewidth" type="range" min="1" max="6" value="2">
+		<span id="val-width">2</span>
+	</div>
+	<div class="row">
+		<label>Colour</label>
+		<div class="swatches" id="swatches"></div>
+	</div>
+	<div class="row">
+		<label>Shape</label>
+		<select id="shape">
+			<option value="diamond">Tile (diamond)</option>
+			<option value="square">Square</option>
+			<option value="cross">Crosshair</option>
+		</select>
+	</div>
+
+	<button id="calibrate">Calibrate from click marker</button>
+	<div id="cal-status" class="note"></div>
+
+	<p class="note">
+		Draws a tile-shaped marker that follows your mouse over the game.
+		<b>Calibrate</b>: press the button, then click the ground in game —
+		the addon measures the game's yellow destination marker and adopts
+		its exact size and proportions. Recalibrate after zooming or tilting
+		the camera. Note: Alt1 cannot read the camera, so the marker follows
+		your cursor smoothly — it cannot snap tile-to-tile like the game's
+		own marker.
+	</p>
+	<div id="alt1-note" class="note hidden" style="color: var(--red);"></div>
+	<div id="diag" class="note" style="font-family: monospace; white-space: pre-wrap;"></div>
+
+	<script src="libs/a1lib.js"></script>
+	<script>
+	(function () {
+		"use strict";
+
+		var COLORS = [
+			[127, 255, 80], [231, 193, 90], [111, 168, 220],
+			[255, 90, 90], [255, 255, 255], [216, 112, 255]
+		];
+		var PREFS_KEY = "rs3qh-tile-v1";
+		var TICK_MS = 60;
+		var prefs = { size: 96, line: 2, color: 0, shape: "diamond", ratio: 0.5 };
+		try {
+			var saved = JSON.parse(localStorage.getItem(PREFS_KEY));
+			if (saved) prefs = saved;
+			if (!prefs.ratio) prefs.ratio = 0.5;
+		} catch (e) { /* defaults */ }
+
+		var timer = null;
+		var calTimer = null;
+
+		// ---- calibration: measure the game's yellow destination marker ----
+
+		function isMarkerYellow(r, g, b) {
+			// The click-destination marker outline is a bright gold-yellow.
+			return r > 190 && g > 150 && b < 140 && (r - b) > 70 && Math.abs(r - g) < 80;
+		}
+
+		// Find the marker's bounding box in an ImageData. The bouncing arrow
+		// above the tile box is also yellow, so cluster yellow rows and keep
+		// only the bottom cluster (the tile outline itself).
+		function measureClickMarker(img) {
+			var w = img.width, h = img.height;
+			var rowCounts = new Array(h);
+			var rowMin = new Array(h);
+			var rowMax = new Array(h);
+			var y, x, total = 0;
+			for (y = 0; y < h; y++) {
+				rowCounts[y] = 0; rowMin[y] = w; rowMax[y] = -1;
+				for (x = 0; x < w; x++) {
+					var i = (y * w + x) * 4;
+					if (isMarkerYellow(img.data[i], img.data[i + 1], img.data[i + 2])) {
+						rowCounts[y]++;
+						if (x < rowMin[y]) rowMin[y] = x;
+						if (x > rowMax[y]) rowMax[y] = x;
+						total++;
+					}
+				}
+			}
+			if (total < 40) return null;
+			// Split rows into clusters separated by >6 empty rows.
+			var clusters = [];
+			var start = -1;
+			var gap = 0;
+			for (y = 0; y < h; y++) {
+				if (rowCounts[y] > 0) {
+					if (start === -1) start = y;
+					gap = 0;
+				} else if (start !== -1 && ++gap > 6) {
+					clusters.push([start, y - gap]);
+					start = -1;
+				}
+			}
+			if (start !== -1) clusters.push([start, h - 1]);
+			if (!clusters.length) return null;
+			var c = clusters[clusters.length - 1]; // bottom cluster = tile box
+			var minx = w, maxx = -1, count = 0;
+			for (y = c[0]; y <= c[1]; y++) {
+				if (rowCounts[y]) {
+					if (rowMin[y] < minx) minx = rowMin[y];
+					if (rowMax[y] > maxx) maxx = rowMax[y];
+					count += rowCounts[y];
+				}
+			}
+			var bw = maxx - minx + 1;
+			var bh = c[1] - c[0] + 1;
+			// Sanity: a tile box is wider than tall and within sane bounds.
+			if (count < 30 || bw < 24 || bw > 400 || bh < 10 || bh > bw * 1.2) return null;
+			return { width: bw, height: bh };
+		}
+
+		function calTick() {
+			var pos = A1lib.getMousePosition();
+			if (!pos) return;
+			var region;
+			try {
+				// Look around the mouse: the marker appears where you click.
+				var rx = Math.max(0, pos.x - 200), ry = Math.max(0, pos.y - 200);
+				region = A1lib.captureHold(rx, ry, 400, 400).toData();
+			} catch (e) {
+				stopCalibrate("Could not capture the game screen.");
+				return;
+			}
+			var m = measureClickMarker(region);
+			if (m) {
+				prefs.size = m.width;
+				prefs.ratio = Math.min(1, Math.max(0.2, m.height / m.width));
+				savePrefs();
+				var sizeInput = document.getElementById("size");
+				sizeInput.value = Math.min(+sizeInput.max, prefs.size);
+				document.getElementById("val-size").textContent = prefs.size;
+				stopCalibrate("Calibrated: tile is " + m.width + "×" + m.height + "px at this zoom.");
+				if (!timer) setOn(true);
+			}
+		}
+
+		function stopCalibrate(msg) {
+			if (calTimer) { clearInterval(calTimer); calTimer = null; }
+			var btn = document.getElementById("calibrate");
+			btn.textContent = "Calibrate from click marker";
+			btn.classList.remove("active");
+			document.getElementById("cal-status").textContent = msg || "";
+		}
+
+		function startCalibrate() {
+			if (typeof window.alt1 === "undefined" || !alt1.permissionPixel) {
+				alert("Calibration needs Alt1 with the pixel permission — re-add the addon if you were not asked for it.");
+				return;
+			}
+			var btn = document.getElementById("calibrate");
+			btn.textContent = "Waiting — click the ground in game…";
+			btn.classList.add("active");
+			document.getElementById("cal-status").textContent = "";
+			calTimer = setInterval(calTick, 120);
+			// Give up after 15s.
+			setTimeout(function () {
+				if (calTimer) stopCalibrate("No marker seen — try again and click closer to your cursor.");
+			}, 15000);
+		}
+
+		function savePrefs() {
+			localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+		}
+
+		function mixColor(r, g, b) {
+			return (b << 0) | (g << 8) | (r << 16) | (255 << 24);
+		}
+
+		function color() {
+			var c = COLORS[prefs.color] || COLORS[0];
+			return mixColor(c[0], c[1], c[2]);
+		}
+
+		var diagCount = 0;
+
+		function diag(msg) {
+			// Update at most ~2x/sec so the panel is readable.
+			if (++diagCount % 8 !== 1) return;
+			document.getElementById("diag").textContent = msg;
+		}
+
+		function draw() {
+			var pos = null;
+			var raw = "n/a";
+			try {
+				raw = String(alt1.mousePosition);
+				pos = A1lib.getMousePosition();
+			} catch (e) {
+				diag("mouse read failed: " + e);
+				return;
+			}
+			if (!pos) {
+				diag("no mouse position (raw=" + raw + ")\n" +
+					"gamestate perm: " + alt1.permissionGameState +
+					" — mouse must be over the RS window");
+				return;
+			}
+			var s = prefs.size / 2;                  // half width
+			var v = (prefs.size * prefs.ratio) / 2;  // half height (calibrated aspect)
+			var col = color();
+			var lw = prefs.line;
+			var t = TICK_MS + 80;
+			var ok = false;
+			try {
+				alt1.overLaySetGroup("tilemark");
+				alt1.overLayClearGroup("tilemark");
+				if (prefs.shape === "diamond") {
+					ok = alt1.overLayLine(col, lw, pos.x, pos.y - v, pos.x + s, pos.y, t);
+					alt1.overLayLine(col, lw, pos.x + s, pos.y, pos.x, pos.y + v, t);
+					alt1.overLayLine(col, lw, pos.x, pos.y + v, pos.x - s, pos.y, t);
+					alt1.overLayLine(col, lw, pos.x - s, pos.y, pos.x, pos.y - v, t);
+				} else if (prefs.shape === "square") {
+					ok = alt1.overLayRect(col, pos.x - s, pos.y - v, prefs.size, prefs.size * prefs.ratio, t, lw);
+				} else {
+					ok = alt1.overLayLine(col, lw, pos.x - s, pos.y, pos.x + s, pos.y, t);
+					alt1.overLayLine(col, lw, pos.x, pos.y - v, pos.x, pos.y + v, t);
+				}
+				// Flush any frozen state left by older versions of this app.
+				alt1.overLayRefreshGroup("tilemark");
+				diag("drawing at " + pos.x + "," + pos.y +
+					" size " + prefs.size + "×" + Math.round(prefs.size * prefs.ratio) +
+					"\noverlay call returned: " + ok +
+					(ok ? "" : "\noverlay perm: " + alt1.permissionOverlay + " — if false, re-add with all permissions"));
+			} catch (e) {
+				diag("overlay draw failed: " + e);
+			}
+		}
+
+		function clear() {
+			try {
+				alt1.overLaySetGroup("tilemark");
+				alt1.overLayClearGroup("tilemark");
+				alt1.overLayRefreshGroup("tilemark");
+			} catch (e) { /* ignore */ }
+		}
+
+		function setOn(on) {
+			var btn = document.getElementById("toggle");
+			if (timer) { clearInterval(timer); timer = null; }
+			if (on) {
+				timer = setInterval(draw, TICK_MS);
+				btn.textContent = "Marker: on";
+				btn.classList.add("active");
+			} else {
+				clear();
+				btn.textContent = "Marker: off";
+				btn.classList.remove("active");
+			}
+		}
+
+		// ---- ui wiring ----
+
+		var sizeInput = document.getElementById("size");
+		var lineInput = document.getElementById("linewidth");
+		var shapeInput = document.getElementById("shape");
+		sizeInput.value = prefs.size;
+		lineInput.value = prefs.line;
+		shapeInput.value = prefs.shape;
+		document.getElementById("val-size").textContent = prefs.size;
+		document.getElementById("val-width").textContent = prefs.line;
+
+		sizeInput.addEventListener("input", function () {
+			prefs.size = +sizeInput.value;
+			document.getElementById("val-size").textContent = prefs.size;
+			savePrefs();
+		});
+		lineInput.addEventListener("input", function () {
+			prefs.line = +lineInput.value;
+			document.getElementById("val-width").textContent = prefs.line;
+			savePrefs();
+		});
+		shapeInput.addEventListener("change", function () {
+			prefs.shape = shapeInput.value;
+			savePrefs();
+		});
+
+		var sw = document.getElementById("swatches");
+		COLORS.forEach(function (c, i) {
+			var d = document.createElement("div");
+			d.className = "swatch" + (i === prefs.color ? " sel" : "");
+			d.style.background = "rgb(" + c.join(",") + ")";
+			d.addEventListener("click", function () {
+				prefs.color = i;
+				savePrefs();
+				sw.querySelectorAll(".swatch").forEach(function (n) { n.classList.remove("sel"); });
+				d.classList.add("sel");
+			});
+			sw.appendChild(d);
+		});
+
+		document.getElementById("calibrate").addEventListener("click", function () {
+			if (calTimer) { stopCalibrate(""); return; }
+			startCalibrate();
+		});
+
+		document.getElementById("toggle").addEventListener("click", function () {
+			if (typeof window.alt1 === "undefined") {
+				alert("The tile marker only works inside Alt1.");
+				return;
+			}
+			if (!alt1.permissionGameState || !alt1.permissionOverlay) {
+				alert("This addon needs the gamestate and overlay permissions — re-add it if you were not asked.");
+				return;
+			}
+			setOn(!timer);
+		});
+
+		// Self-test: ?test=1 draws a synthetic click marker (diamond outline
+		// plus floating arrow) into an ImageData and checks the measurement.
+		if (/[?&]test=1/.test(location.search)) {
+			var timg = new ImageData(400, 400);
+			function put(px, py, r, g, b) {
+				var i = ((py * 400) + px) * 4;
+				timg.data[i] = r; timg.data[i + 1] = g; timg.data[i + 2] = b; timg.data[i + 3] = 255;
+			}
+			// Arrow blob above (y 100-120), gap, diamond outline 96x48 centred (200,250).
+			for (var ay = 100; ay < 120; ay++) for (var ax = 195; ax < 206; ax++) put(ax, ay, 255, 220, 90);
+			for (var d = 0; d <= 48; d++) {
+				put(200 + d, 250 - Math.round(24 - d / 2), 255, 215, 85); // NE edge
+				put(200 + d, 250 + Math.round(24 - d / 2), 250, 210, 80); // SE edge
+				put(200 - d, 250 - Math.round(24 - d / 2), 255, 220, 95); // NW edge
+				put(200 - d, 250 + Math.round(24 - d / 2), 255, 225, 90); // SW edge
+			}
+			var got = measureClickMarker(timg);
+			document.getElementById("cal-status").textContent =
+				got && Math.abs(got.width - 97) <= 3 && Math.abs(got.height - 49) <= 3
+					? "SELFTEST PASS " + got.width + "x" + got.height
+					: "SELFTEST FAIL " + JSON.stringify(got);
+		}
+
+		if (typeof window.alt1 !== "undefined") {
+			alt1.identifyAppUrl("./appconfig-tile.json");
+			window.addEventListener("unload", clear);
+		} else {
+			var note = document.getElementById("alt1-note");
+			note.classList.remove("hidden");
+			var a = document.createElement("a");
+			a.href = "alt1://addapp/" + new URL("appconfig-tile.json", location.href).href;
+			a.textContent = "Click here to add Tile Marker to Alt1";
+			note.appendChild(a);
+		}
+	})();
+	</script>
+</body>
+</html>

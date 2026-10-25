@@ -1,0 +1,4152 @@
+/* RS3 Quest Helper â€” Alt1 overlay app.
+ *
+ * Home view lists every quest/miniquest quick guide on the RuneScape Wiki
+ * (fetched from Category:Quick guides, cached locally). Selecting one
+ * downloads its quick-guide wikitext, parses it into checkable steps, tracks
+ * progress in localStorage, and can paint the current step onto the game
+ * screen via Alt1's overlay API. */
+(function () {
+	"use strict";
+
+	var WIKI_API = "https://runescape.wiki/api.php";
+	var INDEX_CACHE_KEY = "rs3qh-index-v2";
+	// v11: quest-detail list entries now retain their wiki nesting depth.
+	var GUIDE_CACHE_KEY = "rs3qh-guides-v11";
+	var PROGRESS_KEY = "rs3qh-progress-v2";
+	var INDEX_TTL_MS = 7 * 24 * 3600 * 1000;
+	var GUIDE_TTL_MS = 7 * 24 * 3600 * 1000;
+	var GUIDE_CACHE_MAX = 50;
+	var OVERLAY_REFRESH_MS = 10000; // Alt1 overlays expire; repaint every 10s.
+
+	var RM_URL = "https://apps.runescape.com/runemetrics/quests?user=";
+	var RM_CACHE_KEY = "rs3qh-rm-v2";
+	var RM_TTL_MS = 30 * 60 * 1000;
+	var ORDER_CACHE_KEY = "rs3qh-order-v1";
+	var ORDER_TTL_MS = 7 * 24 * 3600 * 1000;
+	var TIMELINE_CACHE_KEY = "rs3qh-timeline-v2";
+	var TIMELINE_TTL_MS = 7 * 24 * 3600 * 1000;
+	var FULLIMG_CACHE_KEY = "rs3qh-fullimg-v1";
+	var FULLIMG_TTL_MS = 7 * 24 * 3600 * 1000;
+	var PREFS_KEY = "rs3qh-prefs-v1";
+
+	var questIndex = [];    // [{ title: "X/Quick guide", name: "X" }]
+	var guide = null;       // parsed guide for the open quest
+	var flatSteps = [];     // steps flattened across sections, in order
+	var progress = load(PROGRESS_KEY, {});
+	var prefs = load(PREFS_KEY, { rsn: "", hideDone: false, sort: "az" });
+	var rmStatuses = null;  // { normalised quest name: "COMPLETED" | "STARTED" | "NOT_STARTED" }
+	var rmEligible = null;  // { normalised quest name: true when requirements are met }
+	var optimalRank = null; // { normalised quest name: position in progression guide }
+	var timelineRank = null; // { normalised quest name: position in the timeline list }
+	var currentQuestTitle = null; // wiki title of the open guide, for reloads
+	var lastScrolledKey = null;   // step the list was last auto-scrolled to
+	var alignDeadline = 0;        // re-align to current step while images settle, until this time
+	var overlayTimer = null;
+
+	// ---------- storage ----------
+
+	function load(key, fallback) {
+		try {
+			var v = JSON.parse(localStorage.getItem(key));
+			return v === null || v === undefined ? fallback : v;
+		} catch (e) {
+			return fallback;
+		}
+	}
+
+	function store(key, value) {
+		try {
+			localStorage.setItem(key, JSON.stringify(value));
+		} catch (e) { /* storage full â€” non-fatal */ }
+	}
+
+	function questProgress() {
+		if (!progress[guide.title]) progress[guide.title] = { done: {} };
+		var p = progress[guide.title];
+		if (!p.items) p.items = {};
+		return p;
+	}
+
+	// ---------- progress export / import (cross-browser sync) ----------
+	// A whole-progress code the user copies to another browser/device (or
+	// shares) and pastes in. Covers every quest's ticked steps and items â€”
+	// the pathway guide included, since its progress lives here too.
+	var PROGRESS_CODE_PREFIX = "RS3QH1:";
+
+	function encodeProgress(obj) {
+		try {
+			return PROGRESS_CODE_PREFIX + btoa(unescape(encodeURIComponent(JSON.stringify(obj || {}))));
+		} catch (e) { return ""; }
+	}
+
+	function decodeProgress(code) {
+		if (typeof code !== "string") return null;
+		code = code.trim();
+		if (code.indexOf(PROGRESS_CODE_PREFIX) !== 0) return null;
+		try {
+			var obj = JSON.parse(decodeURIComponent(escape(atob(code.slice(PROGRESS_CODE_PREFIX.length)))));
+			return (obj && typeof obj === "object") ? obj : null;
+		} catch (e) { return null; }
+	}
+
+	// Union-merge incoming progress into target: adds ticked steps/items,
+	// never un-ticks (safe to import onto an account that's ahead in places).
+	// Returns the count of quests that gained something.
+	function mergeProgress(target, incoming) {
+		var changed = 0;
+		Object.keys(incoming || {}).forEach(function (title) {
+			var inc = incoming[title];
+			if (!inc || typeof inc !== "object") return;
+			var cur = target[title] || (target[title] = { done: {}, items: {} });
+			if (!cur.done) cur.done = {};
+			if (!cur.items) cur.items = {};
+			var touched = false;
+			["done", "items"].forEach(function (field) {
+				var m = inc[field];
+				if (!m || typeof m !== "object") return;
+				Object.keys(m).forEach(function (key) {
+					if (m[key] && !cur[field][key]) { cur[field][key] = true; touched = true; }
+				});
+			});
+			if (touched) changed++;
+		});
+		return changed;
+	}
+
+	function itemChecked(name) {
+		return !!questProgress().items[name.toLowerCase()];
+	}
+
+	function setItemChecked(name, val) {
+		if (val) questProgress().items[name.toLowerCase()] = true;
+		else delete questProgress().items[name.toLowerCase()];
+		store(PROGRESS_KEY, progress);
+	}
+
+	// ---------- wiki api ----------
+
+	function wikiGet(params, cb, errcb) {
+		params.format = "json";
+		params.origin = "*"; // anonymous CORS
+		var qs = Object.keys(params).map(function (k) {
+			return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
+		}).join("&");
+		var xhr = new XMLHttpRequest();
+		xhr.open("GET", WIKI_API + "?" + qs);
+		xhr.onload = function () {
+			try {
+				cb(JSON.parse(xhr.responseText));
+			} catch (e) {
+				errcb("Bad response from the wiki.");
+			}
+		};
+		xhr.onerror = function () { errcb("Could not reach runescape.wiki."); };
+		xhr.send();
+	}
+
+	function fetchQuestIndex(cb, errcb) {
+		var cached = load(INDEX_CACHE_KEY, null);
+		if (cached && Date.now() - cached.ts < INDEX_TTL_MS) {
+			cb(cached.list);
+			return;
+		}
+		var all = [];
+		(function page(cont) {
+			var params = {
+				action: "query",
+				list: "categorymembers",
+				cmtitle: "Category:Quick guides",
+				cmtype: "page",
+				cmlimit: "500"
+			};
+			if (cont) params.cmcontinue = cont;
+			wikiGet(params, function (data) {
+				var members = (data.query && data.query.categorymembers) || [];
+				members.forEach(function (m) {
+					if (/\/Quick guide$/.test(m.title)) {
+						all.push({
+							title: m.title,
+							name: m.title.replace(/\/Quick guide$/, "")
+						});
+					}
+				});
+				if (data["continue"] && data["continue"].cmcontinue) {
+					page(data["continue"].cmcontinue);
+				} else {
+					all.sort(function (a, b) { return a.name.localeCompare(b.name); });
+					store(INDEX_CACHE_KEY, { ts: Date.now(), list: all });
+					cb(all);
+				}
+			}, function (msg) {
+				// Fall back to a stale cache rather than showing nothing.
+				if (cached) cb(cached.list);
+				else errcb(msg);
+			});
+		})(null);
+	}
+
+	function fetchGuide(title, cb, errcb) {
+		var cache = load(GUIDE_CACHE_KEY, {});
+		var hit = cache[title];
+		if (hit && Date.now() - hit.ts < GUIDE_TTL_MS) {
+			cb(hit.data);
+			return;
+		}
+		wikiGet({ action: "parse", page: title, prop: "wikitext" }, function (data) {
+			if (!data.parse || !data.parse.wikitext) {
+				errcb("The wiki returned no guide for this quest.");
+				return;
+			}
+			var parsed = title === PATHWAY_TITLE
+				? parsePathwayGuide(data.parse.wikitext["*"])
+				: parseQuickGuide(data.parse.wikitext["*"]);
+			parsed.title = title;
+			parsed.name = guideDisplayName(title);
+			cache[title] = { ts: Date.now(), data: parsed };
+			pruneGuideCache(cache);
+			store(GUIDE_CACHE_KEY, cache);
+			cb(parsed);
+		}, errcb);
+	}
+
+	// ---------- runemetrics + optimal order ----------
+
+	// Match quest titles across sources: RuneMetrics and the wiki write
+	// names slightly differently ("(miniquest)" suffixes, punctuation).
+	function normName(s) {
+		// Wiki page names carry disambiguators RuneMetrics doesn't use â€”
+		// "Tears of Guthix (quest)" vs "Tears of Guthix".
+		return s.toLowerCase()
+			.replace(/\((mini)?quest\)|\(saga\)|\(minigame\)/g, "")
+			.replace(/&/g, "and")
+			.replace(/[^a-z0-9]+/g, "");
+	}
+
+	// Parse a RuneMetrics quests payload into a normalised status map, or
+	// return null when it does not look like quest data.
+	function parseRmPayload(text) {
+		var data;
+		try {
+			data = JSON.parse(text);
+		} catch (e) {
+			// Some proxies wrap the payload in metadata â€” dig the quests
+			// object out of the body.
+			var s = text.indexOf('{"quests"');
+			if (s === -1) return null;
+			var depth = 0, e2 = -1;
+			for (var i = s; i < text.length; i++) {
+				if (text[i] === "{") depth++;
+				else if (text[i] === "}" && --depth === 0) { e2 = i + 1; break; }
+			}
+			if (e2 === -1) return null;
+			try {
+				data = JSON.parse(text.slice(s, e2));
+			} catch (e3) {
+				return null;
+			}
+		}
+		if (!data || !data.quests || !data.quests.length) return null;
+		var statuses = {}, eligible = {};
+		data.quests.forEach(function (q) {
+			var key = normName(q.title);
+			statuses[key] = q.status;
+			// userEligible is Jagex's own "meets the requirements" flag, so
+			// eligibility never has to be guessed from skill/quest reqs.
+			eligible[key] = q.userEligible === true;
+		});
+		return { statuses: statuses, eligible: eligible };
+	}
+
+	// RuneMetrics sends no CORS headers, so a direct request only works in
+	// permissive environments. Fall back through public CORS proxies; the
+	// only thing sent is the (public) player name.
+	function rmUrls(name) {
+		var direct = RM_URL + encodeURIComponent(name);
+		return [
+			direct,
+			"https://corsproxy.io/?url=" + encodeURIComponent(direct),
+			"https://proxy.corsfix.com/?" + direct,
+			"https://r.jina.ai/" + direct,
+			"https://api.allorigins.win/raw?url=" + encodeURIComponent(direct)
+		];
+	}
+
+	function fetchRuneMetrics(name, force, cb, errcb) {
+		var cached = load(RM_CACHE_KEY, null);
+		if (!force && cached && cached.name === name && Date.now() - cached.ts < RM_TTL_MS) {
+			cb({ statuses: cached.statuses, eligible: cached.eligible || null });
+			return;
+		}
+		var urls = rmUrls(name);
+		(function attempt(i) {
+			if (i >= urls.length) {
+				errcb("Could not reach RuneMetrics directly or via a proxy. Use \"Import manually\" below â€” that always works.");
+				return;
+			}
+			var xhr = new XMLHttpRequest();
+			xhr.open("GET", urls[i]);
+			xhr.timeout = 10000;
+			xhr.onload = function () {
+				var parsed = parseRmPayload(xhr.responseText);
+				if (parsed) {
+					store(RM_CACHE_KEY, { ts: Date.now(), name: name,
+						statuses: parsed.statuses, eligible: parsed.eligible });
+					cb(parsed);
+				} else if (i === 0 && xhr.status === 200) {
+					// Direct request answered but without quests: private profile.
+					errcb("RuneMetrics returned no quests â€” is the profile set to private? (RuneMetrics settings in game)");
+				} else {
+					attempt(i + 1);
+				}
+			};
+			xhr.onerror = function () { attempt(i + 1); };
+			xhr.ontimeout = function () { attempt(i + 1); };
+			xhr.send();
+		})(0);
+	}
+
+	function fetchOptimalOrder(cb, errcb) {
+		var cached = load(ORDER_CACHE_KEY, null);
+		if (cached && Date.now() - cached.ts < ORDER_TTL_MS) {
+			cb(cached.rank);
+			return;
+		}
+		wikiGet({ action: "parse", page: "Quests/Progression_guide", prop: "wikitext" }, function (data) {
+			if (!data.parse || !data.parse.wikitext) {
+				errcb("Could not load the progression guide.");
+				return;
+			}
+			var text = data.parse.wikitext["*"];
+			var rank = {};
+			var n = 0;
+			var re = /data-rowid="([^"]+)"/g;
+			var m;
+			while ((m = re.exec(text)) !== null) {
+				var key = normName(m[1]);
+				if (!(key in rank)) rank[key] = n++;
+			}
+			if (!n) {
+				errcb("The progression guide format changed â€” could not extract an order.");
+				return;
+			}
+			store(ORDER_CACHE_KEY, { ts: Date.now(), rank: rank });
+			cb(rank);
+		}, errcb);
+	}
+
+	// {{FloorNumber|n}}'s parameter counts the ground floor as 1 (US
+	// convention); UK convention calls that the ground floor and starts
+	// counting one storey up. The wiki shows both â€” we render whichever
+	// the user picked (UK by default, matching the game's own wording).
+	function ordinal(n) {
+		var v = n % 100;
+		if (v >= 11 && v <= 13) return n + "th";
+		return n + (["th", "st", "nd", "rd"][n % 10] || "th");
+	}
+	// Best available guess when the user hasn't picked a convention: the
+	// "ground floor = 1st floor" counting is essentially North American,
+	// so US wording for en-US/en-CA browser locales, UK for everything
+	// else. The toolbar dropdown always overrides this.
+	function floorPrefForLocale(lang) {
+		lang = (lang || "").toLowerCase();
+		return (lang === "en-us" || lang === "en-ca") ? "us" : "uk";
+	}
+	function floorPref() {
+		return prefs.floors || floorPrefForLocale(navigator.language);
+	}
+
+	// Themes swap the CSS variable palette via a data attribute; "dark"
+	// (no attribute) is the stylesheet's base.
+	function applyTheme() {
+		var t = prefs.theme || "dark";
+		if (t === "dark") document.documentElement.removeAttribute("data-theme");
+		else document.documentElement.setAttribute("data-theme", t);
+	}
+	// The overlay card's background is all-or-nothing: Alt1 draws overlays onto
+	// the game WITHOUT blending partial alpha, so a half-transparent card comes
+	// out pale/white instead of showing the game. Fully opaque and fully
+	// transparent are the only two that render correctly.
+	function overlayBgOff() {
+		return prefs.overlayBg === "off";
+	}
+	function overlayOpacity() {
+		return overlayBgOff() ? 0 : 1;
+	}
+	// Size sliders (percent). Overlay: the on-screen card is drawn on a
+	// raw-pixel canvas, so it does NOT get Windows DPI scaling and looks tiny
+	// at high resolutions â€” this scales it up. Guide: scales the app's guide
+	// text via a CSS variable. Both default to 100% (no change).
+	function sizePercent(value, fallback, min, max) {
+		var n = parseInt(value, 10);
+		return isNaN(n) ? fallback : Math.max(min, Math.min(max, n));
+	}
+	function overlayScale() {
+		return sizePercent(prefs.overlayScale, 100, 100, 200) / 100;
+	}
+	// Scales all app text via a CSS variable the stylesheet multiplies every
+	// font-size by. Pref key stays "guideScale" for back-compat with settings
+	// saved before this became app-wide.
+	function applyAppTextScale() {
+		document.documentElement.style.setProperty("--app-font-scale",
+			String(sizePercent(prefs.guideScale, 100, 80, 160) / 100));
+	}
+	function floorText(usNum, conv) {
+		var n = parseInt(usNum, 10);
+		if (isNaN(n)) return "floor " + (usNum || "");
+		if (conv === "us") return n <= 0 ? "basement" : ordinal(n) + " floor";
+		var uk = n - 1;
+		if (uk < 0) return "basement";
+		if (uk === 0) return "ground floor";
+		return ordinal(uk) + " floor";
+	}
+
+	// The timeline page renders one wikitable per tab (Pathfinder,
+	// Adventurer, â€¦ Seasonal); row order inside each table IS the in-game
+	// timeline order, and the tabs follow each other chronologically. Walk
+	// every table in document order and rank the first-cell quest links.
+	function parseTimelineOrder(html) {
+		var doc = new DOMParser().parseFromString(html, "text/html");
+		var tables = doc.querySelectorAll("table.wikitable");
+		var rank = {}, n = 0;
+		for (var t = 0; t < tables.length; t++) {
+			var rows = tables[t].querySelectorAll("tr");
+			for (var r = 0; r < rows.length; r++) {
+				var cell = rows[r].querySelector("td");
+				if (!cell) continue; // header row
+				var a = cell.querySelector("a[title]");
+				if (!a) continue;
+				var key = normName(a.getAttribute("title"));
+				if (key && !(key in rank)) rank[key] = n++;
+			}
+		}
+		return n ? rank : null;
+	}
+
+	function fetchTimelineOrder(cb, errcb) {
+		var cached = load(TIMELINE_CACHE_KEY, null);
+		if (cached && Date.now() - cached.ts < TIMELINE_TTL_MS) {
+			cb(cached.rank);
+			return;
+		}
+		// The combined page interleaves miniquests exactly like the in-game
+		// timeline; the quests-only page skips them and shifts the order.
+		wikiGet({ action: "parse", page: "List_of_quests_and_miniquests_by_timeline", prop: "text" }, function (data) {
+			if (!data.parse || !data.parse.text) {
+				errcb("Could not load the timeline quest list.");
+				return;
+			}
+			var rank = parseTimelineOrder(data.parse.text["*"]);
+			if (!rank) {
+				errcb("The timeline page format changed â€” could not extract an order.");
+				return;
+			}
+			store(TIMELINE_CACHE_KEY, { ts: Date.now(), rank: rank });
+			cb(rank);
+		}, errcb);
+	}
+
+	function pruneGuideCache(cache) {
+		var keys = Object.keys(cache);
+		if (keys.length <= GUIDE_CACHE_MAX) return;
+		keys.sort(function (a, b) { return cache[a].ts - cache[b].ts; });
+		while (keys.length > GUIDE_CACHE_MAX) delete cache[keys.shift()];
+	}
+
+	// ---------- wikitext parsing ----------
+	// Quick guides are wikitext with ==Section== headings, {{Checklist|...}}
+	// blocks of "*" bullets, {{Needed|...}} item lines, inline {{Chat
+	// options|...}}, and the occasional wikitable. The parser is tolerant:
+	// templates it does not understand are dropped, links become plain text.
+	// Plain-ASCII sentinels mark chat options and item lines during parsing.
+
+	var CHAT_OPEN = "@@C[";
+	var CHAT_CLOSE = "]C@@";
+	var MAP_OPEN = "@@M[";
+	var MAP_CLOSE = "]M@@";
+	var ITEM_OPEN = "@@I[";
+	var ITEM_CLOSE = "]I@@";
+	var IMG_OPEN = "@@P[";
+	var IMG_CLOSE = "]P@@";
+	var LINK_OPEN = "@@L[";
+	var LINK_CLOSE = "]L@@";
+	var NEEDED_MARK = "@@NEEDED@@";
+
+	// Split template params on top-level pipes (ignoring pipes nested in
+	// {{...}} or [[...]]).
+	function splitParams(body) {
+		var parts = [], depth = 0, cur = "";
+		for (var i = 0; i < body.length; i++) {
+			var two = body.substr(i, 2);
+			if (two === "{{" || two === "[[") { depth++; cur += two; i++; }
+			else if (two === "}}" || two === "]]") { depth--; cur += two; i++; }
+			else if (body[i] === "|" && depth === 0) { parts.push(cur); cur = ""; }
+			else cur += body[i];
+		}
+		parts.push(cur);
+		return parts;
+	}
+
+	function unnamedParams(parts) {
+		return parts.filter(function (p) {
+			return !/^\s*[a-z0-9_ -]+\s*=/i.test(p);
+		}).map(function (p) { return p.trim(); }).filter(Boolean);
+	}
+
+	function namedParam(parts, key) {
+		for (var i = 0; i < parts.length; i++) {
+			var m = /^\s*([a-z0-9_ -]+)\s*=([\s\S]*)$/i.exec(parts[i]);
+			if (m && m[1].trim().toLowerCase() === key) return m[2].trim();
+		}
+		return null;
+	}
+
+	// Map templates carry "x, y" coords plus optional plane/mapID params. The
+	// coords come either as a bare "103,93" arg or an "x:103,y:93" one.
+	function mapSentinel(parts, args) {
+		var coords = null;
+		args.forEach(function (a) {
+			var c = /^(\d{1,5})\s*,\s*(\d{1,5})$/.exec(a) ||
+				/^x:\s*(\d{1,5})\s*,\s*y:\s*(\d{1,5})$/i.exec(a);
+			if (c) coords = { x: +c[1], y: +c[2] };
+		});
+		if (!coords) {
+			var nx = namedParam(parts, "x"), ny = namedParam(parts, "y");
+			if (nx && ny && /^\d{1,5}$/.test(nx) && /^\d{1,5}$/.test(ny)) coords = { x: +nx, y: +ny };
+		}
+		if (!coords) return "";
+		var plane = namedParam(parts, "plane") || "0";
+		var mapId = namedParam(parts, "mapid") || "-1";
+		return MAP_OPEN + coords.x + "," + coords.y + "," + plane + "," + mapId + MAP_CLOSE;
+	}
+
+	// Replace one innermost {{template}} at a time until none remain.
+	function resolveTemplates(text) {
+		for (var guard = 0; guard < 2000; guard++) {
+			var m = /\{\{([^{}]*)\}\}/.exec(text);
+			if (!m) break;
+			var parts = splitParams(m[1]);
+			var name = parts.shift().trim().toLowerCase().replace(/_/g, " ");
+			var args = unnamedParams(parts);
+			var out = "";
+			if (name === "chat options" || name === "chat") {
+				out = CHAT_OPEN + args.join(" / ") + CHAT_CLOSE;
+			} else if (name === "needed" || name === "recommended") {
+				var src = args.join(", ");
+				// {{Needed|recommended=Food and armour}} carries its list in a
+				// named param, so unnamed args come back empty â€” pull it out.
+				if (!src) src = namedParam(parts, "recommended") || "";
+				out = NEEDED_MARK + (name === "recommended" ? "Recommended: " : "") + src;
+				// Item links inside Needed lines are exact wiki page names â€”
+				// keep them (with the required amount, when the guide gives one)
+				// so the backpack scanner knows what to look for. But a "None â€¦"
+				// line lists no items, and a link with a SECTION anchor
+				// ("[[Entrana#Equipment on Entrana|â€¦]]") is a reference to a
+				// place, not an item â€” only a potion DOSE anchor "(3)" belongs to
+				// a real item â€” so neither should reach the scanner.
+				if (!/^\s*none\b/i.test(src)) {
+					var lm, lre = /\[\[([^\]|#]+)(?:#([^\]|]*))?(?:\|([^\]]*))?\]\]/g;
+					while ((lm = lre.exec(src)) !== null) {
+						var iname = lm[1].trim();
+						var anchor = (lm[2] || "").trim();
+						if (anchor && !/^\(\d+\)$/.test(anchor)) continue; // reference, not an item
+						if (/^\(\d+\)$/.test(anchor)) iname += " " + anchor;
+						var qty = 1;
+						var before = /(\d+)\s*(?:x\s*)?$/i.exec(src.slice(Math.max(0, lm.index - 10), lm.index));
+						var labelNum = /^(\d+)\s/.exec((lm[3] || "").trim());
+						if (before) qty = +before[1];
+						else if (labelNum) qty = +labelNum[1];
+						out += ITEM_OPEN + iname + "|" + qty + ITEM_CLOSE;
+					}
+				}
+			} else if (name === "checklist") {
+				out = "\n" + args.join("\n") + "\n";
+			} else if (name === "members") {
+				out = args[0] && /^no$/i.test(args[0]) ? "F2P" : "Members";
+			} else if (name === "sic") {
+				out = args[0] || "";
+			} else if (name === "coins") {
+				out = (args[0] || "") + " coins";
+			} else if (name === "fairycode" || name === "fairy code" || name === "fairyring") {
+				// {{Fairycode|AJQ}} is a fairy-ring destination code â€” keep the
+				// letters so "using fairy code AJQ" survives.
+				out = (args[0] || "").toUpperCase();
+			} else if (name === "floornumber") {
+				out = floorText(args[0], floorPref());
+			} else if (name === "questicon" || name === "questlink" || name === "questreq") {
+				// {{QuestIcon|X}} names a quest (Ironman pathway tables) â€”
+				// keep it as a clickable link, not dropped text.
+				out = args[0] ? LINK_OPEN + args[0] + "|" + args[0] + LINK_CLOSE : "";
+			} else if (name === "sc" || name === "scp") {
+				// {{sc|Prayer}} / {{scp|Prayer|3}} skill icons -> plain text.
+				out = (args[0] || "") + (args[1] ? " " + args[1] : "");
+			} else if (name === "skillreq" || name === "skill req") {
+				// {{Skillreq|Mining|35}} -> "Level 35 Mining". Recommended lists
+				// chain a note after it: "... (to mine sandstone)".
+				out = args[0] ? (args[1] ? "Level " + args[1] + " " + args[0] : args[0]) : "";
+			} else if (name === "achievement") {
+				// {{Achievement|Engage}} names an achievement â€” keep it as a
+				// readable link instead of dropping it to a bare "Medium -".
+				out = args[0] ? LINK_OPEN + args[0] + "|" +
+					args[0].replace(/\s*\(achievement\)$/i, "") + LINK_CLOSE : "";
+			} else if (name === "iconlink") {
+				// Decorative icon + link ("transportation map icon"); keep its
+				// label so the sentence still reads ("find a â€¦"), then the map
+				// link beside it carries the coordinates.
+				out = namedParam(parts, "txt") || args[0] || "";
+			} else if (name === "sq" || name === "!") {
+				out = "|";
+			} else if (name === "npc map" || name === "object map" || name === "map" || name === "maplink") {
+				out = mapSentinel(parts, args);
+			}
+			// Anything else (maps, refs, nav templates, {{QG}} ...) is dropped.
+			text = text.slice(0, m.index) + out + text.slice(m.index + m[0].length);
+		}
+		return text;
+	}
+
+	function cleanMarkup(text) {
+		return text
+			.replace(/<!--[\s\S]*?-->/g, "")
+			.replace(/<ref[^>]*\/>/gi, "")
+			.replace(/<ref[^>]*>[\s\S]*?<\/ref>/gi, "")
+			.replace(/<br\s*\/?>/gi, " ")
+			// <tabber> holds ALTERNATIVE paths (Dimension of Disaster's Black
+			// Arm Gang vs Phoenix Gang). Each tab is "Label=" then content,
+			// separated by "|-|". Turn each label into a heading (flagged as an
+			// alternative so it's clear you only do one) and drop the separators,
+			// so both paths parse as their own sections instead of leaking
+			// "|-| Phoenix Gang=" into a step.
+			.replace(/<tabber>([\s\S]*?)<\/tabber>/gi, function (_, inner) {
+				return "\n" + inner
+					.replace(/^\s*\|-\|\s*$/gm, "")
+					.replace(/^\s*([^=|\n][^=\n]*?)\s*=\s*$/gm, "\n=== $1 (alternative path) ===\n") + "\n";
+			})
+			// <gallery> blocks list one image per line ("Name.png|caption")
+			// with no [[File:]] brackets; convert each line to an image
+			// sentinel BEFORE the generic tag strip removes the wrapper and
+			// leaks the file names into the step text.
+			.replace(/<gallery[^>]*>([\s\S]*?)<\/gallery>/gi, function (_, inner) {
+				return inner.split("\n").map(function (line) {
+					line = line.trim();
+					if (!line) return "";
+					var sep = line.indexOf("|");
+					var name = (sep === -1 ? line : line.slice(0, sep)).replace(/^(File|Image):/i, "").trim();
+					if (!/\.(png|jpe?g|gif|webp)$/i.test(name)) return "";
+					var caption = sep === -1 ? "" : line.slice(sep + 1).trim();
+					return IMG_OPEN + name + "|" + caption + IMG_CLOSE;
+				}).join(" ");
+			})
+			// <imagemap> is a clickable navigation map (The Fremennik Trials):
+			// a "File:X.png" line plus coordinate "rect â€¦" links. Keep the
+			// map image, drop the coordinate lines â€” otherwise the generic
+			// tag strip leaks the filename and numbers into the step text.
+			.replace(/<imagemap[^>]*>([\s\S]*?)<\/imagemap>/gi, function (_, inner) {
+				var m = /(?:File|Image):\s*([^|\n\]]+?\.(?:png|jpe?g|gif|webp))/i.exec(inner);
+				return m ? IMG_OPEN + m[1].trim() + "|" + IMG_CLOSE : "";
+			})
+			.replace(/<[^>]+>/g, "")
+			.replace(/\[\[(?:File|Image):([^\[\]]*(?:\[\[[^\]]*\]\][^\[\]]*)*)\]\]/gi, function (_, inner) {
+				// Keep guide images (puzzle solutions etc.) as sentinels; the
+				// last non-formatting parameter is the caption.
+				var parts = splitParams(inner);
+				var name = parts.shift().trim();
+				if (!/\.(png|jpe?g|gif|webp)$/i.test(name)) return "";
+				var caption = "";
+				parts.forEach(function (p) {
+					p = p.trim();
+					if (!p) return;
+					if (/^(thumb|thumbnail|frame|frameless|border|right|left|center|none|baseline|sub|super|top|text-top|middle|bottom|text-bottom|upright[\s\S]*|x?\d+(x\d+)?px|link=[\s\S]*|alt=[\s\S]*|page=[\s\S]*|class=[\s\S]*|lang=[\s\S]*)$/i.test(p)) return;
+					caption = p;
+				});
+				return IMG_OPEN + name + "|" + caption + IMG_CLOSE;
+			})
+			.replace(/\[\[Category:[^\]]*\]\]/gi, "")
+			.replace(/\[\[([^\]|#\n]+)(?:#[^\]|\n]*)?\|([^\]\n]*)\]\]/g, function (_, page, label) {
+				return LINK_OPEN + page.trim() + "|" + label + LINK_CLOSE;
+			})
+			.replace(/\[\[([^\]#|\n]+)(?:#[^\]\n]*)?\]\]/g, function (_, page) {
+				var p = page.trim();
+				return LINK_OPEN + p + "|" + p + LINK_CLOSE;
+			})
+			.replace(/\[\[([^\]]*)\]\]/g, "$1")
+			.replace(/\[https?:\/\/[^\s\]]+ ([^\]]*)\]/g, "$1")
+			.replace(/'''''|'''|''/g, "")
+			.replace(/&nbsp;/g, " ")
+			.replace(/[ \t]+/g, " ");
+	}
+
+	// Pull chat-option and map sentinels out of a line -> { text, chat, maps }.
+	function extractChat(line) {
+		var chat = [];
+		var maps = [];
+		var links = [];
+		var text = line;
+		var start;
+		// Links first: replace each sentinel with its label so every other
+		// extraction (chat, needed, notes) sees plain text; remember the
+		// page for clickable names in steps.
+		while ((start = text.indexOf(LINK_OPEN)) !== -1) {
+			var lend = text.indexOf(LINK_CLOSE, start);
+			if (lend === -1) { text = text.replace(LINK_OPEN, ""); continue; }
+			var lbody = text.slice(start + LINK_OPEN.length, lend);
+			var lsep = lbody.indexOf("|");
+			var lpage = (lsep === -1 ? lbody : lbody.slice(0, lsep)).trim();
+			var llabel = (lsep === -1 ? lbody : lbody.slice(lsep + 1)).trim();
+			if (lpage && llabel) links.push({ page: lpage, label: llabel });
+			text = text.slice(0, start) + llabel + text.slice(lend + LINK_CLOSE.length);
+		}
+		while ((start = text.indexOf(CHAT_OPEN)) !== -1) {
+			var end = text.indexOf(CHAT_CLOSE, start);
+			if (end === -1) { text = text.replace(CHAT_OPEN, ""); continue; }
+			var inner = text.slice(start + CHAT_OPEN.length, end).trim();
+			if (inner) chat.push(inner);
+			text = text.slice(0, start) + text.slice(end + CHAT_CLOSE.length);
+		}
+		while ((start = text.indexOf(MAP_OPEN)) !== -1) {
+			var mend = text.indexOf(MAP_CLOSE, start);
+			if (mend === -1) { text = text.replace(MAP_OPEN, ""); continue; }
+			var raw = text.slice(start + MAP_OPEN.length, mend).split(",");
+			if (raw.length === 4) {
+				maps.push({ x: +raw[0], y: +raw[1], plane: +raw[2], mapId: +raw[3] });
+			}
+			text = text.slice(0, start) + text.slice(mend + MAP_CLOSE.length);
+		}
+		var items = [];
+		while ((start = text.indexOf(ITEM_OPEN)) !== -1) {
+			var iend = text.indexOf(ITEM_CLOSE, start);
+			if (iend === -1) { text = text.replace(ITEM_OPEN, ""); continue; }
+			var ibody = text.slice(start + ITEM_OPEN.length, iend);
+			var isep = ibody.lastIndexOf("|");
+			var iname = (isep === -1 ? ibody : ibody.slice(0, isep)).trim();
+			var iqty = isep === -1 ? 1 : Math.max(1, parseInt(ibody.slice(isep + 1), 10) || 1);
+			if (iname) items.push({ name: iname, qty: iqty });
+			text = text.slice(0, start) + text.slice(iend + ITEM_CLOSE.length);
+		}
+		var images = [];
+		while ((start = text.indexOf(IMG_OPEN)) !== -1) {
+			var pend = text.indexOf(IMG_CLOSE, start);
+			if (pend === -1) { text = text.replace(IMG_OPEN, ""); continue; }
+			var body = text.slice(start + IMG_OPEN.length, pend);
+			var sep = body.indexOf("|");
+			var file = (sep === -1 ? body : body.slice(0, sep)).trim();
+			var caption = sep === -1 ? "" : body.slice(sep + 1).replace(/\s+/g, " ").trim();
+			if (file) images.push({ file: file, caption: caption });
+			text = text.slice(0, start) + text.slice(pend + IMG_CLOSE.length);
+		}
+		// Scrub any leftover sentinel fragments (e.g. from wiki markup that
+		// splits a sentinel across lines) so they never reach the UI.
+		text = text.replace(/@@[CMIPL]\[|\][CMIPL]@@|@@NEEDED@@/g, "");
+		// A dropped icon or an extracted map inside parentheses ("find a icon
+		// (map).") leaves empty brackets behind â€” remove them, then tidy any
+		// stray space before punctuation the removal exposes.
+		text = text.replace(/\(\s*\)/g, " ").replace(/\s+([.,!?;:])/g, "$1");
+		return {
+			text: text.replace(/\s+/g, " ").trim(),
+			chat: chat.join(" / ") || null,
+			maps: maps,
+			items: items,
+			images: images,
+			links: links
+		};
+	}
+
+	// A wikitable cell may lead with HTML attributes separated from its
+	// content by a single top-level pipe: `align="center" width="100" |
+	// [[File:â€¦]]`. Drop the attribute half so it doesn't leak into the row.
+	function stripCellAttrs(cell) {
+		var depth = 0;
+		for (var i = 0; i < cell.length; i++) {
+			var two = cell.substr(i, 2);
+			if (two === "[[" || two === "{{") { depth++; i++; }
+			else if (two === "]]" || two === "}}") { depth--; i++; }
+			else if (cell[i] === "|" && depth === 0) {
+				var left = cell.slice(0, i);
+				return (/=/.test(left) && !/\[\[|\{\{/.test(left)) ? cell.slice(i + 1) : cell;
+			}
+		}
+		return cell;
+	}
+
+	// Parse a wikitable block (array of raw lines) into display rows.
+	function parseTable(lines) {
+		var rows = [], cells = [];
+		function flush() {
+			var texts = [], maps = [];
+			cells.forEach(function (c) {
+				var parsed = extractChat(cleanMarkup(resolveTemplates(stripCellAttrs(c))));
+				if (parsed.text) texts.push(parsed.text);
+				maps = maps.concat(parsed.maps);
+			});
+			if (texts.length) rows.push({ text: texts.join(" â€” "), maps: maps });
+			cells = [];
+		}
+		lines.forEach(function (line) {
+			line = line.trim();
+			if (/^\{\|/.test(line) || /^\|\}/.test(line) || /^\|\+/.test(line) || /^!/.test(line)) return;
+			if (/^\|-/.test(line)) { flush(); return; }
+			if (/^\|/.test(line)) {
+				line.slice(1).split("||").forEach(function (c) { cells.push(c); });
+			} else if (cells.length) {
+				cells[cells.length - 1] += " " + line;
+			}
+		});
+		flush();
+		return rows;
+	}
+
+	function parseQuickGuide(wikitext) {
+		var sections = [];
+		var current = null;
+		// Prose that appears in a section BEFORE its first step (a "highly
+		// recommendedâ€¦" tip under a {{Needed}}). Held here and attached to the
+		// first step as a note, instead of leaking into the Items-needed list.
+		var pendingNote = "";
+		// A {{Map}} placed at the top of a section (Holy Grail's "The location
+		// to blow the whistle", which the step refers to as "the map on the
+		// right") â€” buffered and attached to that first step, since we have no
+		// side panel to show it in.
+		var pendingMaps = [];
+		var lines = wikitext.split("\n");
+		var i;
+
+		// Pre-pass: pull out wikitable blocks so template resolution does not
+		// mangle them; leave a placeholder line referencing the parsed rows.
+		var tables = [];
+		var kept = [];
+		for (i = 0; i < lines.length; i++) {
+			if (/^\s*\{\|/.test(lines[i])) {
+				var tbl = [];
+				while (i < lines.length && !/^\s*\|\}/.test(lines[i])) tbl.push(lines[i++]);
+				if (i < lines.length) tbl.push(lines[i]);
+				tables.push(parseTable(tbl));
+				kept.push("%%TABLE:" + (tables.length - 1) + "%%");
+			} else {
+				kept.push(lines[i]);
+			}
+		}
+
+		function newSection(title) {
+			current = { title: title, needed: [], steps: [], images: [] };
+			sections.push(current);
+			pendingNote = "";
+			pendingMaps = [];
+		}
+
+		function lastStep() {
+			return current && current.steps.length ? current.steps[current.steps.length - 1] : null;
+		}
+
+		// A section that never got a step keeps its buffered tip as info (so a
+		// note-only section isn't lost); otherwise the first step already took
+		// it. Called when a section ends.
+		function flushPending() {
+			if (pendingNote && current && !current.steps.length) current.needed.push(pendingNote);
+			pendingNote = "";
+			pendingMaps = [];
+		}
+
+		// Templates like {{Checklist|...}} span multiple lines, so resolve
+		// them over the whole document, then walk the resulting lines.
+		var resolved = cleanMarkup(resolveTemplates(kept.join("\n")));
+
+		resolved.split("\n").forEach(function (ln) {
+			var trimmed = ln.trim();
+			if (!trimmed) return;
+
+			var h = /^==+\s*(.*?)\s*=+=$/.exec(trimmed);
+			if (h) {
+				flushPending();
+				var title = extractChat(h[1]).text;
+				if (/^(overview|rewards?|required items|credits)$/i.test(title)) current = null;
+				else newSection(title);
+				return;
+			}
+			if (!current) return;
+
+			var tm = /^%%TABLE:(\d+)%%$/.exec(trimmed);
+			if (tm) {
+				var rows = tables[+tm[1]];
+				if (rows.length) {
+					var host = lastStep();
+					if (!host) {
+						current.steps.push({ text: "Locations:", chat: null, sub: [] });
+						host = lastStep();
+					}
+					host.sub = (host.sub || []).concat(rows.map(function (r) { return { text: r.text, maps: r.maps }; }));
+				}
+				return;
+			}
+
+			if (trimmed.indexOf(NEEDED_MARK) !== -1) {
+				var neededLine = extractChat(trimmed.split(NEEDED_MARK).join(""));
+				if (neededLine.text) current.needed.push(neededLine.text);
+				if (neededLine.items.length) {
+					current.items = (current.items || []).concat(neededLine.items);
+				}
+				if (neededLine.images.length) current.images = current.images.concat(neededLine.images);
+				return;
+			}
+
+			var b = /^(\*+|#+)\s*(.*)$/.exec(trimmed);
+			if (b) {
+				var depth = b[1].length;
+				var parsedLine = extractChat(b[2]);
+				if (!parsedLine.text && !parsedLine.chat && !parsedLine.images.length) return;
+				if (depth === 1 || !lastStep()) {
+					var step = { text: parsedLine.text, chat: parsedLine.chat, maps: parsedLine.maps, images: parsedLine.images, links: parsedLine.links, sub: [] };
+					// A tip / a {{Map}} that preceded this section's first step
+					// attaches here (the step the map is "on the right" of).
+					if (pendingNote) { step.note = pendingNote; pendingNote = ""; }
+					if (pendingMaps.length) { step.maps = pendingMaps.concat(step.maps); pendingMaps = []; }
+					current.steps.push(step);
+				} else {
+					lastStep().sub.push({ text: parsedLine.text, chat: parsedLine.chat, maps: parsedLine.maps, links: parsedLine.links });
+					if (parsedLine.images.length) {
+						lastStep().images = (lastStep().images || []).concat(parsedLine.images);
+					}
+				}
+				return;
+			}
+
+			// Loose prose inside a section: attach as a note to the last step.
+			// A leading ":"/";" is definition-list indentation (a tip), not
+			// content. Images on their own line belong to the latest step, or
+			// the section when no step exists yet. Prose that arrives BEFORE the
+			// first step is buffered (pendingNote) for that step rather than
+			// dumped into the Items-needed list.
+			var prose = extractChat(trimmed.replace(/^[:;]+\s*/, ""));
+			if (!prose.text && !prose.images.length && !prose.maps.length) return;
+			var stepHost = lastStep();
+			if (stepHost) {
+				if (prose.text) stepHost.note = (stepHost.note ? stepHost.note + " " : "") + prose.text;
+				if (prose.maps.length) stepHost.maps = (stepHost.maps || []).concat(prose.maps);
+				if (prose.images.length) stepHost.images = (stepHost.images || []).concat(prose.images);
+			} else {
+				if (prose.text) pendingNote = (pendingNote ? pendingNote + " " : "") + prose.text;
+				if (prose.maps.length) pendingMaps = pendingMaps.concat(prose.maps);
+				if (prose.images.length) current.images = current.images.concat(prose.images);
+			}
+		});
+		flushPending();
+
+		// A picture placed before a section's steps (Heartstealer's "Making the
+		// smoke bombs" sits under the heading) renders at the top, ahead of the
+		// step it illustrates. Pin each such section image to the step its
+		// caption clearly names, so it appears inline instead of too early.
+		sections.forEach(function (s) {
+			if (!s.images.length || !s.steps.length) return;
+			s.images = s.images.filter(function (im) {
+				var idx = im.caption ? bestStepForCaption(im.caption, s.steps) : -1;
+				if (idx < 0) return true; // no clear step â†’ keep as a section image
+				var host = s.steps[idx];
+				host.images = (host.images || []).concat(im);
+				return false;
+			});
+		});
+
+		// Drop sections that ended up with no steps and no info.
+		sections = sections.filter(function (s) { return s.steps.length || s.needed.length || s.images.length; });
+		return { sections: sections };
+	}
+
+	// ---------- full-guide image enrichment ----------
+	// Quick guides carry almost no pictures; the full walkthrough pages do
+	// (puzzle solutions, step screenshots). Both are organised under the
+	// same section headings, so we pull the full guide's images and slot
+	// them into the matching quick-guide section â€” pinned to a specific
+	// step when a caption clearly names it, otherwise shown for the section.
+
+	function normHeading(s) {
+		return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+	}
+
+	// { normalised section heading -> [{file, caption}] } for the useful
+	// images on a full quest page. Chatheads, icons and un-captioned
+	// portraits (caption is just a "60px" size) are dropped.
+	function parseFullGuideImages(wikitext) {
+		var parts = wikitext.split(/^==\s*([^=].*?)\s*==\s*$/m); // [pre, h1, b1, h2, b2, â€¦]
+		var out = {};
+		for (var i = 1; i < parts.length; i += 2) {
+			var head = normHeading(parts[i]);
+			var body = parts[i + 1] || "";
+			var re = /\[\[File:([^\]]+?)\]\]/gi, m;
+			var imgs = [];
+			while ((m = re.exec(body)) !== null) {
+				var seg = m[1].split("|");
+				var file = seg[0].trim();
+				if (/chathead|\bicon\b|\.gif$/i.test(file)) continue;
+				var caption = "";
+				for (var s = 1; s < seg.length; s++) {
+					var p = seg[s].trim();
+					if (/^(thumb|thumbnail|frame|frameless|border|right|left|center|centre|none|baseline|middle|top|bottom|upright[\s\S]*|x?\d+(x\d+)?px|link=[\s\S]*|alt=[\s\S]*|page=[\s\S]*|class=[\s\S]*)$/i.test(p)) continue;
+					caption = p;
+				}
+				if (!caption) continue; // portrait / decorative
+				caption = extractChat(cleanMarkup(resolveTemplates(caption))).text.replace(/\s+/g, " ").trim();
+				if (caption) imgs.push({ file: file, caption: caption });
+			}
+			if (imgs.length) out[head] = (out[head] || []).concat(imgs);
+		}
+		return out;
+	}
+
+	var CAP_STOPWORDS = " the you your are and not for with into what that this will its from his her out back down over near then them into a an of to in on at is it as be by " +
+		"again there their where which while would could should about after before around through still every other these those being going doing have has had just than then here when who whom also onto upon very much some more most ";
+
+	function capWords(s) {
+		return (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/)
+			.filter(function (t) { return t.length > 2 && CAP_STOPWORDS.indexOf(" " + t + " ") === -1; });
+	}
+
+	// Which step in a section a captioned image belongs to, or -1 for none.
+	// Normally needs two shared words so descriptive captions don't land on
+	// the wrong step. But a SINGLE shared word is trusted when it's specific
+	// to this quest â€” at least five letters and appearing in no more than
+	// three steps of the guide slice ("organ" in Rune Mysteries, which shows
+	// up in the play/press/take-key steps) â€” which reliably pins puzzle/UI
+	// screenshots whose captions are short (Rune Mysteries' "organ" shows up
+	// in four steps). A weak match returns -1 and the image falls back to
+	// section-level display.
+	function bestStepForCaption(caption, steps) {
+		var cw = capWords(caption);
+		if (!cw.length) return -1;
+		// How many steps each caption word appears in (whole guide slice).
+		var freq = {};
+		cw.forEach(function (t) { freq[t] = 0; });
+		var stepWords = steps.map(function (st) { return capWords(st.text); });
+		stepWords.forEach(function (sw) {
+			cw.forEach(function (t) { if (sw.indexOf(t) !== -1) freq[t]++; });
+		});
+		var bestIdx = -1, bestHits = 0, bestDistinct = false;
+		steps.forEach(function (st, i) {
+			var sw = stepWords[i];
+			var hits = 0, distinct = false;
+			cw.forEach(function (t) {
+				if (sw.indexOf(t) === -1) return;
+				hits++;
+				if (t.length >= 5 && freq[t] <= 4) distinct = true;
+			});
+			if (hits > bestHits) { bestHits = hits; bestIdx = i; bestDistinct = distinct; }
+		});
+		if (bestHits >= 2) return bestIdx;
+		if (bestHits === 1 && bestDistinct) return bestIdx;
+		return -1;
+	}
+
+	// ---------- Efficient Ironman Pathway (special guide) ----------
+	// The pathway page is not a quick guide: its steps are rows of
+	// "static-row-header-step" wikitables (Activity | Notes | Level) under
+	// the Part 1..6 headings. Parse those rows into checkable steps; the
+	// Miniguides half of the page and non-step tables are skipped.
+
+	var PATHWAY_TITLE = "Ironman Mode/Guide/Efficient Ironman Pathway Guide";
+
+	function parsePathwayGuide(wikitext) {
+		var main = wikitext.split(/\n=\s*Miniguides\s*=/)[0];
+		var sections = [];
+		var current = null;
+
+		function cellParse(raw) {
+			// MediaWiki cell attributes: "| style=... | content".
+			var idx = raw.indexOf("|");
+			if (idx !== -1) {
+				var pre = raw.slice(0, idx);
+				if (/=\s*"/.test(pre) && pre.indexOf("[[") === -1) raw = raw.slice(idx + 1);
+			}
+			// Bullet lists inside a cell read as "â€¢"-separated sentences.
+			raw = raw.replace(/^[ \t]*[*#;:]+[ \t]*/gm, "â€¢ ");
+			var r = extractChat(cleanMarkup(resolveTemplates(raw)));
+			r.text = (r.text || "").replace(/\s+/g, " ").replace(/^â€¢\s*/, "").trim();
+			return r;
+		}
+
+		var lines = main.split("\n");
+		for (var i = 0; i < lines.length; i++) {
+			var trimmed = lines[i].trim();
+			var h = /^==\s*(.*?)\s*==$/.exec(trimmed);
+			if (h && h[1].charAt(0) !== "=") {
+				current = { title: extractChat(cleanMarkup(h[1])).text, needed: [], steps: [], images: [] };
+				sections.push(current);
+				continue;
+			}
+			if (!current || !/^\{\|.*static-row-header-step/.test(trimmed)) continue;
+
+			// Collect this step table and split it into rows.
+			var tl = [];
+			for (i++; i < lines.length && !/^\|\}/.test(lines[i].trim()); i++) tl.push(lines[i]);
+			var rows = [], cur = null;
+			tl.forEach(function (l) {
+				if (/^\|-/.test(l.trim())) { if (cur) rows.push(cur); cur = []; }
+				else if (cur) cur.push(l);
+			});
+			if (cur) rows.push(cur);
+
+			rows.forEach(function (r) {
+				var cells = [];
+				r.forEach(function (l) {
+					var t = l.trim();
+					if (/^!/.test(t)) return;
+					if (/^\|/.test(t)) {
+						t.slice(1).split("||").forEach(function (c) { cells.push(c); });
+					} else if (cells.length) {
+						cells[cells.length - 1] += "\n" + l;
+					}
+				});
+				if (!cells.length) return;
+				var act = cellParse(cells[0] || "");
+				if (!act.text && !act.links.length) return;
+				var note = cellParse(cells[1] || "");
+				var lvl = cellParse(cells[2] || "").text;
+				var noteText = note.text && !/^(n\/?a|-|none)$/i.test(note.text) ? note.text : "";
+				if (lvl && !/^(n\/?a|-|none)$/i.test(lvl)) {
+					noteText = (noteText ? noteText + " " : "") + "[Level: " + lvl + "]";
+				}
+				current.steps.push({
+					text: act.text,
+					chat: act.chat || null,
+					maps: act.maps.concat(note.maps),
+					images: act.images.concat(note.images),
+					links: act.links.concat(note.links),
+					note: noteText || undefined,
+					sub: []
+				});
+			});
+		}
+		return { sections: sections.filter(function (s) { return s.steps.length; }) };
+	}
+
+	function guideDisplayName(title) {
+		return title === PATHWAY_TITLE ? "Efficient Ironman Pathway" : title.replace(/\/Quick guide$/, "");
+	}
+
+	// Extract the {{Quest details}} items/recommended lists from a quest's
+	// main page â€” these carry the "obtainable during the quest" style
+	// annotations that quick guides leave out.
+	function parseQuestDetails(wikitext) {
+		var idx = wikitext.search(/\{\{Quest details/i);
+		if (idx === -1) return { items: [], recommended: [] };
+		var depth = 0, end = -1;
+		for (var i = idx; i < wikitext.length - 1; i++) {
+			var two = wikitext.substr(i, 2);
+			if (two === "{{") { depth++; i++; }
+			else if (two === "}}") { depth--; i++; if (!depth) { end = i + 1; break; } }
+		}
+		if (end === -1) return { items: [], recommended: [] };
+		var parts = splitParams(wikitext.slice(idx + 2, end - 2));
+		function listOf(key) {
+			var v = namedParam(parts, key);
+			if (!v || /^(none|no)\.?$/i.test(v.trim())) return [];
+			return cleanMarkup(resolveTemplates(v)).split("\n").map(function (l) {
+				var marker = /^\s*([*#]+)\s*/.exec(l);
+				var text = extractChat(l.replace(/^\s*[*#:]+\s*/, "")).text;
+				return text ? { text: text, depth: marker ? marker[1].length - 1 : 0 } : null;
+			}).filter(Boolean);
+		}
+		return { items: listOf("items"), recommended: listOf("recommended") };
+	}
+
+	function attachQuestDetails(cb) {
+		if (guide.details) { cb(); return; }
+		wikiGet({ action: "parse", page: guide.name, prop: "wikitext" }, function (data) {
+			var wt = data.parse && data.parse.wikitext ? data.parse.wikitext["*"] : "";
+			guide.details = parseQuestDetails(wt);
+			var cache = load(GUIDE_CACHE_KEY, {});
+			if (cache[guide.title]) {
+				cache[guide.title].data = guide;
+				store(GUIDE_CACHE_KEY, cache);
+			}
+			cb();
+		}, function () {
+			// Non-fatal: the panel just shows the quick-guide info alone.
+			cb();
+		});
+	}
+
+	// ---------- alt1 integration ----------
+
+	function inAlt1() {
+		return typeof window.alt1 !== "undefined";
+	}
+
+	// Alt1 colours are packed (a<<24 | r<<16 | g<<8 | b).
+	function mixColor(r, g, b, a) {
+		if (a === undefined) a = 255;
+		return (b << 0) | (g << 8) | (r << 16) | (a << 24);
+	}
+
+	// Pick a compact window of sub-steps for the overlay. Keep the next
+	// unfinished one visible, with one or two completed rows as context,
+	// instead of filling the card with a long checklist.
+	function overlaySubRows(subs, subDone, maxRows) {
+		subs = subs || [];
+		maxRows = maxRows || 4;
+		var next = -1;
+		for (var i = 0; i < subs.length; i++) {
+			if (!subDone(i)) { next = i; break; }
+		}
+		var start = 0;
+		if (subs.length > maxRows && next >= 0) {
+			start = Math.max(0, Math.min(next - 1, subs.length - maxRows));
+		}
+		var end = Math.min(subs.length, start + maxRows);
+		return {
+			rows: subs.slice(start, end).map(function (sub, i) {
+				var index = start + i;
+				return { text: sub.text || "", chat: sub.chat || null, done: !!subDone(index), current: index === next };
+			}),
+			before: start,
+			after: subs.length - end
+		};
+	}
+
+	// Render the overlay as a proper card on a canvas: dark rounded panel
+	// with wrapped step text, progress, sub-steps, chat options and items.
+	function renderOverlayCard(step, doneCount, total) {
+		var W = 440, PAD = 12, LH = 20, MAXH = 400;
+		// All layout below is in native units; a single ctx.scale renders the
+		// whole card larger so the text stays crisp instead of being upscaled.
+		var S = overlayScale();
+		var canvas = document.createElement("canvas");
+		canvas.width = Math.round(W * S);
+		canvas.height = Math.round(MAXH * S);
+		var ctx = canvas.getContext("2d", { willReadFrequently: true });
+		ctx.scale(S, S);
+
+		function wrap(text, font, maxLines) {
+			ctx.font = font;
+			var words = text.split(" ");
+			var lines = [], cur = "";
+			for (var i = 0; i < words.length; i++) {
+				var probe = cur ? cur + " " + words[i] : words[i];
+				if (ctx.measureText(probe).width > W - PAD * 2 && cur) {
+					lines.push(cur);
+					cur = words[i];
+					if (lines.length === maxLines) {
+						lines[maxLines - 1] = lines[maxLines - 1].replace(/\s*\S*$/, "") + "â€¦";
+						return lines;
+					}
+				} else {
+					cur = probe;
+				}
+			}
+			if (cur) lines.push(cur);
+			return lines.slice(0, maxLines);
+		}
+
+		// Autosize: the step text wraps fully instead of being cut off.
+		var stepLines = step ? wrap(step.text, "600 15px 'Segoe UI', sans-serif", 8) : ["Quest complete! ðŸŽ‰"];
+		var chatLines = step && step.chat ? wrap("Chat: " + step.chat, "13px 'Segoe UI', sans-serif", 3) : [];
+		var subRows = step && step.subs && step.subs.length
+			? overlaySubRows(step.subs, function (k) { return isSubDone(step, k); }, 4)
+			: null;
+		var renderedSubs = subRows ? subRows.rows.map(function (row) {
+			var prefix = row.done ? "[x] " : (row.current ? "> " : "[ ] ");
+			var text = prefix + row.text + (row.chat ? " (Chat: " + row.chat + ")" : "");
+			return { lines: wrap(text, "12px 'Segoe UI', sans-serif", 1), done: row.done, current: row.current };
+		}) : [];
+		var hiddenSubs = subRows ? (subRows.before ? 1 : 0) + (subRows.after ? 1 : 0) : 0;
+		if (subRows) {
+			// Leave room for the checklist when a long parent step also has
+			// several sub-steps to display.
+			stepLines = wrap(step.text, "600 15px 'Segoe UI', sans-serif", 4);
+			if (step.chat) chatLines = wrap("Chat: " + step.chat, "13px 'Segoe UI', sans-serif", 2);
+		}
+		// Items needed for the current section, if the guide lists any.
+		var neededLines = [];
+		if (step && guide.sections && guide.sections[step.sectionIndex] && guide.sections[step.sectionIndex].needed.length) {
+			neededLines = wrap("Items: " + guide.sections[step.sectionIndex].needed.join("; "),
+				"12px 'Segoe UI', sans-serif", 2);
+		}
+		if (subRows && neededLines.length > 1) neededLines = neededLines.slice(0, 1);
+
+		var H = Math.min(MAXH,
+			PAD + 16 + 6 + stepLines.length * LH + chatLines.length * 18 +
+			(renderedSubs.length ? 18 + renderedSubs.length * 17 + hiddenSubs * 17 : 0) +
+			neededLines.length * 17 + PAD);
+
+		// Panel
+		ctx.clearRect(0, 0, W, 220);
+		ctx.beginPath();
+		var r = 8;
+		ctx.moveTo(r, 0); ctx.lineTo(W - r, 0); ctx.arcTo(W, 0, W, r, r);
+		ctx.lineTo(W, H - r); ctx.arcTo(W, H, W - r, H, r);
+		ctx.lineTo(r, H); ctx.arcTo(0, H, 0, H - r, r);
+		ctx.lineTo(0, r); ctx.arcTo(0, 0, r, 0, r);
+		ctx.fillStyle = "rgba(18, 22, 18, " + overlayOpacity() + ")";
+		ctx.fill();
+		// Fully opaque: any partial alpha renders pale over the game once the
+		// card background is off, so the border must not be semi-transparent.
+		ctx.strokeStyle = "rgb(231, 193, 90)";
+		ctx.lineWidth = 1.5;
+		ctx.stroke();
+
+		// Header: quest name + progress
+		var y = PAD + 11;
+		ctx.font = "700 11px 'Segoe UI', sans-serif";
+		ctx.fillStyle = "#e7c15a";
+		var header = (guide.name || "").toUpperCase();
+		ctx.fillText(header, PAD, y, W - PAD * 2 - 60);
+		ctx.textAlign = "right";
+		ctx.fillText(doneCount + " / " + total, W - PAD, y);
+		ctx.textAlign = "left";
+		y += 6;
+
+		// Step text
+		ctx.font = "600 15px 'Segoe UI', sans-serif";
+		ctx.fillStyle = "#f2ecd8";
+		stepLines.forEach(function (l) { y += LH; ctx.fillText(l, PAD, y); });
+
+		// Chat options
+		ctx.font = "13px 'Segoe UI', sans-serif";
+		ctx.fillStyle = "#7fb8f0";
+		chatLines.forEach(function (l) { y += 18; ctx.fillText(l, PAD, y); });
+
+		// Sub-step checklist: done rows fade back, while the next unfinished
+		// row is green. This updates immediately whenever a sub-step is ticked.
+		if (renderedSubs.length) {
+			y += 18;
+			ctx.font = "700 11px 'Segoe UI', sans-serif";
+			ctx.fillStyle = "#e7c15a";
+			ctx.fillText("SUB-STEPS", PAD, y);
+			ctx.font = "12px 'Segoe UI', sans-serif";
+			if (subRows.before) {
+				y += 17;
+				ctx.fillStyle = "#8f8874";
+				ctx.fillText("... " + subRows.before + " earlier sub-step" + (subRows.before === 1 ? "" : "s"), PAD, y);
+			}
+			renderedSubs.forEach(function (row) {
+				y += 17;
+				ctx.fillStyle = row.done ? "#8f8874" : (row.current ? "#9fd47f" : "#f2ecd8");
+				ctx.fillText(row.lines[0], PAD, y);
+			});
+			if (subRows.after) {
+				y += 17;
+				ctx.fillStyle = "#8f8874";
+				ctx.fillText("... " + subRows.after + " more sub-step" + (subRows.after === 1 ? "" : "s"), PAD, y);
+			}
+		}
+
+		// Items needed for this section
+		ctx.font = "12px 'Segoe UI', sans-serif";
+		ctx.fillStyle = "#9fd47f";
+		neededLines.forEach(function (l) { y += 17; ctx.fillText(l, PAD, y); });
+
+		return ctx.getImageData(0, 0, Math.round(W * S), Math.round(H * S));
+	}
+
+	function overlayCardPos(w, h) {
+		var margin = 18;
+		switch (prefs.overlayPos || "tc") {
+			case "tl": return { x: margin, y: margin };
+			case "tr": return { x: Math.max(0, alt1.rsWidth - w - margin), y: margin };
+			case "bc": return { x: Math.max(0, Math.round((alt1.rsWidth - w) / 2)), y: Math.max(0, alt1.rsHeight - h - 130) };
+			case "free": return {
+				x: Math.round((prefs.overlayFreeX === undefined ? 0.5 : prefs.overlayFreeX) * Math.max(0, alt1.rsWidth - w)),
+				y: Math.round((prefs.overlayFreeY === undefined ? 0.05 : prefs.overlayFreeY) * Math.max(0, alt1.rsHeight - h))
+			};
+			default: return { x: Math.max(0, Math.round((alt1.rsWidth - w) / 2)), y: margin };
+		}
+	}
+
+	function paintOverlay() {
+		if (!inAlt1() || !alt1.permissionOverlay || !guide) return;
+		// Game closed or unlinked: clean up rather than paint into nowhere.
+		if (alt1.rsLinked === false) { clearOverlay(); return; }
+		var step = currentStep();
+		var doneCount = 0;
+		flatSteps.forEach(function (s) { if (isDone(s)) doneCount++; });
+		try {
+			var card = renderOverlayCard(step, doneCount, flatSteps.length);
+			var pos = overlayCardPos(card.width, card.height);
+			alt1.overLaySetGroup("rs3qh");
+			alt1.overLayClearGroup("rs3qh");
+			alt1.overLayImage(pos.x, pos.y, A1lib.encodeImageString(card), card.width, OVERLAY_REFRESH_MS + 2000);
+			alt1.overLayRefreshGroup("rs3qh");
+		} catch (e) {
+			// Fall back to plain text if image overlays are unavailable.
+			var text = step ? "Quest: " + step.text : "Quest complete!";
+			if (step && step.chat) text += "  [Chat: " + step.chat + "]";
+			if (text.length > 120) text = text.slice(0, 117) + "...";
+			try {
+				alt1.overLaySetGroup("rs3qh");
+				alt1.overLayClearGroup("rs3qh");
+				alt1.overLayTextEx(text, mixColor(231, 193, 90), 16,
+					Math.round(alt1.rsWidth / 2), 40, OVERLAY_REFRESH_MS + 2000, "", true, true);
+				alt1.overLayRefreshGroup("rs3qh");
+			} catch (e2) { /* overlay unavailable */ }
+		}
+	}
+
+	function clearOverlay() {
+		if (!inAlt1() || !alt1.permissionOverlay) return;
+		try {
+			alt1.overLaySetGroup("rs3qh");
+			alt1.overLayClearGroup("rs3qh");
+			alt1.overLayRefreshGroup("rs3qh");
+		} catch (e) { /* ignore */ }
+	}
+
+	// Brief on-screen confirmation (its own overlay group so it never
+	// disturbs the step card) â€” used to show the Alt1 hotkey registered.
+	function flashOverlayText(msg) {
+		if (!inAlt1() || !alt1.permissionOverlay) return;
+		try {
+			alt1.overLaySetGroup("rs3qh-flash");
+			alt1.overLayClearGroup("rs3qh-flash");
+			alt1.overLayTextEx(msg, mixColor(141, 255, 90), 18,
+				Math.round(alt1.rsWidth / 2), 70, 1100, "", true, true);
+			alt1.overLayRefreshGroup("rs3qh-flash");
+		} catch (e) { /* overlay unavailable */ }
+	}
+
+	function setOverlay(on) {
+		var btn = document.getElementById("btn-overlay");
+		if (overlayTimer) { clearInterval(overlayTimer); overlayTimer = null; }
+		if (on) {
+			paintOverlay();
+			overlayTimer = setInterval(paintOverlay, OVERLAY_REFRESH_MS);
+			btn.textContent = "Overlay: on";
+			btn.classList.add("active");
+		} else {
+			clearOverlay();
+			btn.textContent = "Overlay: off";
+			btn.classList.remove("active");
+		}
+	}
+
+	// ---------- assist: dialogue highlighting + chat watching ----------
+	// Inspired by bolt-questhelper's conversation highlighting, rebuilt on
+	// Alt1's pixel API: capture the screen, OCR the open dialogue via the
+	// alt1 DialogReader, and draw an overlay box around the option matching
+	// the current step's chat options. The chatbox is watched for quest
+	// completion messages.
+
+	// Fast ticks keep the highlight responsive â€” a stale box expires ~450ms
+	// after the dialogue changes (next tick usually clears it in ~200ms;
+	// Alt1's own overlay compositing adds a little on top). Conversation
+	// tracking and chat watching sample on slower cadences via CONVO_EVERY/
+	// CHAT_EVERY so their tick-count thresholds keep roughly the original
+	// wall-clock meaning (~600ms and ~1.4s).
+	var ASSIST_INTERVAL_MS = 200;
+	var CONVO_EVERY = 3;
+	var CHAT_EVERY = 7;
+	var AUTO_KEY = "rs3qh-auto-v1";
+	var assistTimer = null;
+	var assistTickN = 0;
+	var dialogReader = null;
+	var chatReader = null;
+	var chatFound = false;
+	var autoAdvance = load(AUTO_KEY, false);
+
+	// Conversation tracker for auto-ticking dialogue steps. A conversation
+	// "ends" when a dialogue was on screen for >=2 ticks and then gone for
+	// >=3 ticks (~2s). Crucially, ending alone is NOT enough to tick: one
+	// of the step's expected chat options must have been seen matched
+	// during the conversation (the evidence) â€” otherwise unrelated
+	// dialogues (cutscenes, eavesdropping, other NPCs) would tick steps
+	// whose dialogue never happened.
+	//
+	// Steps like "1 Convince / 2 Persuade / 3 Threaten" list several
+	// options on the SAME screen that must each be tried in separate
+	// conversations â€” when several candidates match one screen at once,
+	// that many evidenced conversations are required before the step
+	// ticks.
+	// maxSeq/lastSeq/holds/seqAtHold gate multi-pick chains: a step whose
+	// chat lists several picks in ONE conversation ("2 .../2 .../Accept/3
+	// .../3 ...", Rune Memories) must not tick when the dialogue merely
+	// vanishes mid-chain â€” the quest-offer window (or a cutscene) hides the
+	// chatbox between picks and would otherwise read as a finished
+	// conversation. We only complete once the LAST expected pick has been
+	// seen; an earlier vanish is a pause, not an end.
+	var convo = { key: null, seen: 0, gone: 0, evidence: null, required: 1, completions: 0,
+		maxSeq: -1, lastSeq: -1, holds: 0, seqAtHold: -1 };
+
+	// Returns null (nothing to do), { none: true } (a conversation ended
+	// but its options never matched â€” do not tick), { partial, required }
+	// (one of several required conversations done), or the evidence
+	// target { key, subIndex } to tick.
+	function convoObserve(key, dialogVisible, matchedTarget, required, seq) {
+		if (convo.key !== key) {
+			convo.key = key;
+			convo.seen = 0;
+			convo.gone = 0;
+			convo.evidence = null;
+			convo.required = 1;
+			convo.completions = 0;
+			convo.maxSeq = -1;
+			convo.lastSeq = -1;
+			convo.holds = 0;
+			convo.seqAtHold = -1;
+		}
+		if (dialogVisible) {
+			convo.seen++;
+			convo.gone = 0;
+			if (matchedTarget) {
+				convo.evidence = matchedTarget;
+				if (required && (matchedTarget.subIndex === null || matchedTarget.subIndex === undefined) &&
+					required > convo.required) {
+					convo.required = required;
+				}
+				// Track how far through a gated chain we've got. The chain
+				// simply HAVING a real last pick (seq.last >= 0) arms the gate,
+				// even while only "Any" has matched so far â€” so a step whose
+				// final pick comes after a cutscene (Let Them Eat Pie: "Any / 2
+				// I think I've had enough") is not ticked early when the
+				// cutscene ends the conversation. maxSeq only advances on a
+				// positively matched pick; if that last pick never appears, the
+				// stall valve completes the step after a couple of holds.
+				if (seq && seq.last >= 0) {
+					convo.lastSeq = seq.last;
+					if (seq.index >= 0 && seq.index > convo.maxSeq) convo.maxSeq = seq.index;
+				}
+			}
+			return null;
+		}
+		if (convo.seen >= 2) {
+			convo.gone++;
+			if (convo.gone >= 3) {
+				var ev = convo.evidence;
+				// Sequence gate: for a gated parent chain that hasn't reached
+				// its LAST pick, a vanish is an interruption (quest-offer
+				// window, cutscene), not the end â€” hold without ticking so the
+				// resumed conversation can finish. Safety valve: if two holds
+				// pass with no further progress, the last pick simply isn't
+				// matching (OCR/text drift), so stop holding and complete
+				// rather than stall forever.
+				if (ev && ev.key === key &&
+					(ev.subIndex === null || ev.subIndex === undefined) &&
+					convo.lastSeq >= 0 && convo.maxSeq < convo.lastSeq) {
+					var stalled = convo.holds >= 1 && convo.maxSeq <= convo.seqAtHold;
+					if (!stalled) {
+						convo.holds++;
+						convo.seqAtHold = convo.maxSeq;
+						convo.seen = 0;
+						convo.gone = 0;
+						return { held: true, reached: convo.maxSeq + 1, total: convo.lastSeq + 1 };
+					}
+				}
+				convo.seen = 0;
+				convo.gone = 0;
+				convo.evidence = null;
+				if (!ev || ev.key !== key) return { none: true };
+				// Sub-steps are granular already â€” tick directly.
+				if (ev.subIndex !== null && ev.subIndex !== undefined) return ev;
+				convo.completions++;
+				if (convo.completions >= convo.required) return ev;
+				return { partial: convo.completions, required: convo.required };
+			}
+		}
+		return null;
+	}
+
+	// How many distinct chat candidates of this step match the current
+	// options screen (multiple at once = "try each of these").
+	// Which option-screen of the current conversation is showing (0-based):
+	// advances when the visible options change while the dialogue stays
+	// open; resets on a new guide step or when Assist is restarted, NOT
+	// on temporary NPC response gaps. Drives bare-number guide chains.
+	// Dialogue pick cursor (keyed by guide step and option target).
+	// IMPORTANT: NPC responses can hide the whole dialogue for >600ms.
+	// That is not evidence the GUIDE STEP changed, so never clear nextCand
+	// merely because frame detection temporarily returns no position.
+	var optScreen = { key: null, sig: null, idx: 0, gone: 0, optionsGone: 0, nextCand: {}, matchedCand: -1, matchedTarget: null };
+
+	// Commit the last *highlighted* choice only after a real dialogue
+	// transition: a changed options menu or two consecutive frames with no
+	// readable option menu. We cannot observe the click directly; this is
+	// the same transition evidence the previous reader used, but now it
+	// also covers a temporarily invisible dialogue box.
+	function commitMatchedOption() {
+		if (optScreen.matchedTarget && optScreen.matchedCand >= 0) {
+			var key = optScreen.matchedTarget;
+			optScreen.nextCand[key] = Math.max(optScreen.nextCand[key] || 0, optScreen.matchedCand + 1);
+		}
+		optScreen.matchedCand = -1;
+		optScreen.matchedTarget = null;
+	}
+
+	// Index of the visible options screen for bare-number guide chains.
+	// Changes to the options list advance one screen; a new guide step
+	// resets every queue pointer.
+	function screenIndexFor(key, opts) {
+		var sig = opts.map(function (o) { return o.text || ""; }).join("|");
+		if (optScreen.key !== key) {
+			optScreen.key = key; optScreen.sig = sig; optScreen.idx = 0;
+			optScreen.nextCand = {}; optScreen.matchedCand = -1; optScreen.matchedTarget = null;
+		} else if (optScreen.sig !== sig) {
+			commitMatchedOption();
+			optScreen.sig = sig; optScreen.idx++;
+		}
+		optScreen.gone = 0;
+		optScreen.optionsGone = 0;
+		return optScreen.idx;
+	}
+
+	// A response text screen, or absence of the dialogue frame, between
+	// menus is evidence of an option being selected. This also handles
+	// identical returning menus after the NPC has spoken (RuneScape often
+	// redisplays previously chosen options until the whole chat is done).
+	function screenIndexNoOptions() {
+		if (optScreen.key === null) return;
+		optScreen.optionsGone++;
+		if (optScreen.optionsGone < 2) return; // ignore one-frame OCR misses
+		if (optScreen.matchedTarget && optScreen.matchedCand >= 0) {
+			commitMatchedOption();
+			// Even if the same text returns, count it as a new screen.
+			optScreen.sig = null;
+		}
+	}
+
+	function screenIndexGone() {
+		if (optScreen.key === null) return;
+		optScreen.gone++;
+		// A missing frame is a no-options screen, too; previously we only
+		// called screenIndexNoOptions() for readable NPC response text.
+		screenIndexNoOptions();
+		// Do NOT reset optScreen.key/nextCand here. NPC replies, cutscenes,
+		// and quest-offer windows can hide the dialogue for multiple ticks.
+		// The next guide step or toggling Assist resets the state instead.
+	}
+
+	// Whether auto-tick must hold off completing a step: only unticked
+	// sub-steps that have their OWN dialogue count. A chatless sub is an
+	// informational note and never blocks (it rides the setDone cascade).
+	function autoTickBlockedBySubs(step, subDone) {
+		return (step.subs || []).some(function (sub, k) { return sub.chat && !subDone(k); });
+	}
+
+	// Extract the named person from the guide's instruction. This is only a
+	// safety gate for dialogue matching and Auto mode: a readable, conflicting
+	// dialogue title must not be accepted as this step's conversation.
+	function npcNamesForText(text) {
+		var names = [];
+		var patterns = [
+			/(?:talk|speak)\s+to\s+(?:the\s+)?(.+?)(?=\s+(?:in|on|at|near|next to|east|west|north|south|outside|inside|by)\b|[,.]|$)/i,
+			/return\s+to\s+(?:the\s+)?(.+?)(?=[,.]|$)/i,
+			/give\s+.+?\s+to\s+(?:the\s+)?(.+?)(?=\s+(?:in|on|at|near|next to|east|west|north|south|outside|inside|by)\b|[,.]|$)/i
+		];
+		patterns.forEach(function (re) {
+			var m = re.exec(text || "");
+			if (!m) return;
+			var name = m[1].replace(/\s+/g, " ").trim();
+			// Generic instructions cannot identify a particular NPC.
+			if (!name || /^(any|a|one of|some)\b/i.test(name)) return;
+			if (names.indexOf(name) === -1) names.push(name);
+		});
+		return names;
+	}
+
+	function normNpcName(name) {
+		return (name || "").toLowerCase()
+			.replace(/^(the\s+)?/, "")
+			.replace(/\b(?:king|captain|lieutenant)\s+/g, "")
+			.replace(/[^a-z0-9 ]+/g, " ")
+			.replace(/\s+/g, " ").trim();
+	}
+
+	function dialogTitleConflicts(target, title) {
+		var names = (target && target.npcNames) || [];
+		var got = normNpcName(title);
+		// DialogReader returns "choose an option" on some skins; that is not
+		// an NPC identity, so preserve Auto's normal behaviour in that case.
+		if (!names.length || !got || /choose|option/.test(got)) return false;
+		return !names.some(function (name) {
+			var want = normNpcName(name);
+			return want && (want === got || want.indexOf(got) !== -1 || got.indexOf(want) !== -1);
+		});
+	}
+
+	// Dialogue targets for a step, sub-steps FIRST: a conversation that
+	// matches a sub belongs to that sub. The parent's chat often ends in
+	// "Any", which would otherwise claim every conversation as parent
+	// evidence and (via setDone's cascade) sweep unticked subs done.
+	function assistTargets(step, subDone) {
+		var targets = [];
+		(step.subs || []).forEach(function (sub, k) {
+			if (sub.chat && !subDone(k)) {
+				targets.push({ chat: sub.chat, subIndex: k, label: sub.text, optionKey: "sub:" + k,
+					npcNames: npcNamesForText(sub.text) });
+			}
+		});
+		if (step.chat) targets.push({ chat: step.chat, subIndex: null, label: step.text, optionKey: "parent",
+			npcNames: npcNamesForText(step.text) });
+		return targets;
+	}
+
+	function countMatchedCandidates(chatField, opts) {
+		var n = 0;
+		chatField.split(" / ").forEach(function (cand) {
+			cand = cand.trim();
+			if (/^any$/i.test(cand)) return;
+			// Only text candidates whose number also agrees with the matched
+			// option's position count. Bare numbers never do: "1 / 1 / 1 / 4"
+			// is successive screens of ONE conversation, not options to try
+			// separately, so they must not raise the conversations-required
+			// count â€” and neither may chain remnants for later screens.
+			if (bestOptionFor(cand, opts)) n++;
+		});
+		return n;
+	}
+
+	// How many SEPARATE conversations a step needs before auto-tick, decided
+	// from the guide text alone. Almost always 1: a single conversation walks
+	// through as many option-screens as it likes (Rune Mysteries' Ellaron:
+	// "2 .../3 .../3 .../3 .../2 ..." is five picks in ONE talk). The only
+	// exception is a step that enumerates every option of ONE screen and
+	// wants each tried in its own conversation â€” Soul Searching's
+	// "1 Convince / 2 Persuade. / 3 Threaten." Those candidates are numbered
+	// exactly 1..N with no repeats, which is the signature we key on;
+	// repeated or offset numbers mean sequential screens of one conversation.
+	function requiredConversations(chatField) {
+		var nums = [];
+		chatField.split(" / ").forEach(function (cand) {
+			cand = cand.trim();
+			if (!cand || /^any$/i.test(cand)) return;
+			var m = /^(\d)[.)]?/.exec(cand);
+			nums.push(m ? +m[1] : 0);
+		});
+		if (nums.length < 2) return 1;
+		var sorted = nums.slice().sort(function (a, b) { return a - b; });
+		for (var i = 0; i < sorted.length; i++) {
+			if (sorted[i] !== i + 1) return 1; // not a full 1..N enumeration
+		}
+		return nums.length;
+	}
+
+	function assistAvailable() {
+		return inAlt1() && alt1.permissionPixel && alt1.permissionOverlay &&
+			typeof A1lib !== "undefined" && typeof Dialog !== "undefined";
+	}
+
+	// Normalise option text for comparison: lowercase, no punctuation.
+	function normOpt(s) {
+		return s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+	}
+
+	// Fuzzy option-text comparison, scored: exact text beats a substring
+	// match beats token overlap (>=60% of the candidate's meaningful words,
+	// tolerating OCR-dropped characters); 0 means no match. Scoring matters
+	// because similar options ("Can you go away?" / "Can you help me?") can
+	// both clear the overlap threshold â€” the caller must prefer the best.
+	// Words too common to signal WHICH option is meant â€” "Ariane says the
+	// tower is in danger" must not fuzzy-match "Why won't you let Ariane
+	// into the tower?" off shared filler words.
+	var OPT_STOPWORDS = " the you your are and not for with into what that this will its ";
+
+	function optTextScore(cand, optText) {
+		if (!cand || !optText) return 0;
+		if (cand === optText) return 3;
+		// Substring only counts when both sides are substantial â€” a 1-2
+		// char OCR fragment appearing inside the candidate is noise.
+		if (cand.length >= 3 && optText.length >= 3 &&
+			(optText.indexOf(cand) !== -1 || cand.indexOf(optText) !== -1)) return 2;
+		var ctoks = cand.split(" ").filter(function (t) {
+			return t.length > 2 && OPT_STOPWORDS.indexOf(" " + t + " ") === -1;
+		});
+		if (ctoks.length < 2) return 0;
+		var otoks = optText.split(" ");
+		var hit = 0;
+		ctoks.forEach(function (t) { if (otoks.indexOf(t) !== -1) hit++; });
+		var frac = hit / ctoks.length;
+		return frac >= 0.6 ? frac : 0;
+	}
+
+	// Best on-screen option for one TEXT chat candidate, or null. A
+	// candidate that carries a number must also LAND on that number: in
+	// chains ("3 Ariane says... / 3 What are you going to do? / 4
+	// Goodbye.") the number is the option's position on its OWN screen, so
+	// a text match sitting at a different position (Goodbye at 5, not 4)
+	// belongs to a later screen and must stay silent.
+	function bestOptionFor(cand, opts, ignoreNumber) {
+		var numMatch = /^(\d)[.)]?\s*(.*)$/.exec(cand);
+		var num = numMatch ? +numMatch[1] : null;
+		var textPart = normOpt(numMatch ? numMatch[2] : cand);
+		// No text at all â†’ a bare option number, handled by the caller's
+		// position fallback. Short text ("9", a riddle answer) is kept:
+		// optTextScore still only matches it EXACTLY, so it lands on its own
+		// screen and stays silent elsewhere (never a stray position match).
+		if (!textPart.length) return null;
+		var best = null, bestScore = 0, bestIdx = -1;
+		opts.forEach(function (o, i) {
+			var s = optTextScore(textPart, normOpt(o.text || ""));
+			if (s > bestScore) { bestScore = s; best = o; bestIdx = i; }
+		});
+		if (!best) return null;
+		// The number is the option's position on its screen â€” enforced so a
+		// chain's text candidate can't grab the same word at a different
+		// position on another screen. ignoreNumber lifts this for a single-pick
+		// step, where there's no chain to confuse and the on-screen number can
+		// differ from the guide's (Duck Quest lists "1 Yes." for confirms that
+		// show Yes second).
+		if (!ignoreNumber && num !== null && bestIdx + 1 !== num) return null;
+		return best;
+	}
+
+	// Strongest match across the WHOLE chain, ignoring the ordered pointer â€”
+	// used only as a fallback when the forward scan finds nothing. The
+	// candidate pointer can drift ahead of the conversation (a dark room
+	// briefly hides the options, which reads as an advance), skipping the
+	// screen's real answer; this re-finds it so a clearly-correct option still
+	// highlights and the pointer re-syncs. Restricted to candidates whose text
+	// is UNIQUE in the chain and matches strongly (full word overlap or
+	// better) with the right option number, so a repeated/returning menu
+	// (Hunt for Red Raktuber's dance answers) is never matched out of order.
+	function bestChainMatch(cands, opts, fromCand) {
+		var textCount = {};
+		cands.forEach(function (c) {
+			var m = /^(\d)[.)]?\s*(.*)$/.exec(c);
+			var t = normOpt(m ? m[2] : c);
+			if (t.length >= 3) textCount[t] = (textCount[t] || 0) + 1;
+		});
+		var best = null, bestScore = 0, bestCi = -1;
+		// Forward only: never re-box a candidate the pointer has already passed.
+		// A returning menu re-offering a chosen option (Shield of Arrav: Reldo
+		// and Charlie keep re-showing their menu) would otherwise loop, and
+		// that's indistinguishable from a genuine pointer drift, so we don't
+		// reach backwards â€” an unrecovered drift just shows no highlight.
+		for (var ci = Math.max(0, fromCand || 0); ci < cands.length; ci++) {
+			if (/^any$/i.test(cands[ci])) continue;
+			var nm = /^(\d)[.)]?\s*(.*)$/.exec(cands[ci]);
+			var text = normOpt(nm ? nm[2] : cands[ci]);
+			var num = nm ? +nm[1] : null;
+			if (text.length < 3 || textCount[text] !== 1) continue;
+			for (var oi = 0; oi < opts.length; oi++) {
+				var s = optTextScore(text, normOpt(opts[oi].text || ""));
+				if (s >= 1 && (num === null || oi + 1 === num) && s > bestScore) {
+					bestScore = s; best = opts[oi]; bestCi = ci;
+				}
+			}
+		}
+		return best ? { opt: best, ci: bestCi } : null;
+	}
+
+	// A returning NPC menu often repeats a choice already selected.
+	// Never let an earlier choice match a later guide candidate merely
+	// because their common words make a fuzzy OCR match (for example,
+	// "Where is Melzar's map piece?" vs "Where is Thazar's map piece?").
+	// Keep original positions intact for numbered-choice verification.
+	// If the guide explicitly repeats the SAME wording later, do allow it.
+	function maskConsumedOptions(cands, opts, candidateStart) {
+		var start = Math.max(0, candidateStart || 0);
+		if (!start) return opts;
+		function candText(c) {
+			var m = /^(\d)[.)]?\s*(.*)$/.exec(c);
+			return normOpt(m ? m[2] : c);
+		}
+		var earlier = cands.slice(0, start).map(candText).filter(Boolean);
+		var remaining = cands.slice(start).map(candText).filter(Boolean);
+		return opts.map(function (opt) {
+			var t = normOpt(opt.text || "");
+			return earlier.indexOf(t) !== -1 && remaining.indexOf(t) === -1
+				? { text: "" } : opt;
+		});
+	}
+
+	// The step's chat field looks like "1 Talk about the quest. / Any" â€”
+	// candidates separated by " / ", each either "Any", a bare option
+	// number, or a number plus the option text. Candidates usually belong
+	// to DIFFERENT screens of a conversation chain, so a text candidate
+	// that does not match this screen must stay silent â€” falling back to
+	// its number would box the wrong option (numbers only count when the
+	// guide gives a number alone).
+	function matchOptions(chatField, opts, screenIdx, candidateStart) {
+		var picked = [];
+		var hasAny = false;
+		function add(o) { if (picked.indexOf(o) === -1) picked.push(o); }
+
+		// A chain of bare numbers ("1 / 1 / 1 / 4") is one conversation's
+		// successive screens, not simultaneous alternatives: when the
+		// caller tracks which option-screen of the conversation is shown,
+		// highlight only that screen's number.
+		var cands = chatField.split(" / ").map(function (c) { return c.trim(); });
+		var scanOpts = maskConsumedOptions(cands, opts, candidateStart);
+		if (screenIdx !== undefined && cands.length > 1 &&
+			cands.every(function (c) { return /^\d[.)]?$/.test(c); })) {
+			var cur = +cands[Math.min(screenIdx, cands.length - 1)].charAt(0);
+			return (cur >= 1 && cur <= opts.length) ? [opts[cur - 1]] : [];
+		}
+
+		// Follow the guide in sequence: highlight only its next matching
+		// choice, even if later choices appear on the very same NPC menu.
+		// candidateStart advances after a confirmed dialogue transition.
+		var firstCand = Math.max(0, candidateStart || 0);
+		for (var ci = firstCand; ci < cands.length; ci++) {
+			var cand = cands[ci];
+			if (/^any$/i.test(cand)) { hasAny = true; continue; }
+			var opt = bestOptionFor(cand, scanOpts);
+			if (!opt) {
+				// Position fallback ONLY for a candidate that is purely a
+				// number (no text). A number WITH text â€” even short text like
+				// "2 9." (the sphinx riddle answer in Icthlarin's Little
+				// Helper) â€” must match that text or stay silent, so it never
+				// boxes whatever happens to sit at that position on another
+				// screen (previously "I don't know, I don't want to risk my
+				// cat" got boxed instead of "Totally positive").
+				var numMatch = /^(\d)[.)]?\s*(.*)$/.exec(cand);
+				if (numMatch && !normOpt(numMatch[2]).length) {
+					var num = +numMatch[1];
+					if (num >= 1 && num <= opts.length) opt = scanOpts[num - 1] && scanOpts[num - 1].text ? opts[num - 1] : null;
+				}
+			}
+			if (opt) {
+				add(opt);
+				break; // one option only: never highlight later guide picks yet
+			}
+		}
+		// Forward scan found nothing. A single-pick step has no chain to
+		// disambiguate, so trust a clear text match even when the option's
+		// number differs from the guide's â€” but only until the pick is made:
+		// once the pointer has advanced past it, a menu that returns to the
+		// same option (Shield of Arrav: Reldo keeps re-offering "Do you know
+		// whereâ€¦") must NOT be highlighted again, so the step can move on.
+		// Multi-candidate chains re-sync on a strong unique match instead.
+		if (!picked.length) {
+			var real = cands.filter(function (c) { return !/^any$/i.test(c); });
+			if (real.length === 1) {
+				if (!(candidateStart > 0)) {
+					var solo = bestOptionFor(real[0], scanOpts, true);
+					if (solo) picked = [solo];
+				}
+			} else {
+				var fb = bestChainMatch(cands, scanOpts, candidateStart);
+				if (fb) picked = [fb.opt];
+			}
+		}
+		// "Any" only means "every option works" when no specific candidate
+		// matched this screen (guides chain "1 Talk about X / Any").
+		if (!picked.length && hasAny) picked = opts.slice();
+		return picked;
+	}
+
+	// A chain candidate that can actually land on an options screen: a
+	// numbered pick, or a multi-word text option. "Any" and lone action
+	// words ("Accept" â€” a quest-window button, not a chat option) can't, so
+	// they never define the end of the sequence.
+	function isMatchableCand(cand) {
+		cand = (cand || "").trim();
+		if (!cand || /^any$/i.test(cand)) return false;
+		if (/^\d/.test(cand)) return true;
+		return cand.split(/\s+/).length >= 2;
+	}
+
+	// Index of the LAST matchable candidate in a chain, or -1. Drives the
+	// auto-tick sequence gate: a step is only "finished" once this pick has
+	// been seen. Returns -1 for single-pick chains (nothing to gate).
+	function lastMatchableCand(chatField) {
+		var cands = chatField.split(" / ");
+		var last = -1;
+		for (var i = 0; i < cands.length; i++) {
+			if (isMatchableCand(cands[i])) last = i;
+		}
+		return last;
+	}
+
+	// Which chain candidate the current options screen satisfies (its index),
+	// or -1. Mirrors matchOptions' sequential picking precedence so the gate
+	// counts the same pick the highlight points at.
+	function matchedCandIndex(chatField, opts, screenIdx, candidateStart) {
+		var cands = chatField.split(" / ").map(function (c) { return c.trim(); });
+		var scanOpts = maskConsumedOptions(cands, opts, candidateStart);
+		if (screenIdx !== undefined && cands.length > 1 &&
+			cands.every(function (c) { return /^\d[.)]?$/.test(c); })) {
+			var pos = Math.min(screenIdx, cands.length - 1);
+			var cur = +cands[pos].charAt(0);
+			return (cur >= 1 && cur <= opts.length) ? pos : -1;
+		}
+		var enumerated = requiredConversations(chatField) > 1;
+		var firstCand = Math.max(0, candidateStart || 0);
+		for (var ci = firstCand; ci < cands.length; ci++) {
+			var cand = cands[ci];
+			if (/^any$/i.test(cand)) continue;
+			var opt = bestOptionFor(cand, scanOpts);
+			if (!opt) {
+				var nm = /^(\d)[.)]?\s*(.*)$/.exec(cand);
+				if (nm && !normOpt(nm[2]).length) {
+					var num = +nm[1];
+					if (num >= 1 && num <= opts.length) opt = scanOpts[num - 1] && scanOpts[num - 1].text ? opts[num - 1] : null;
+				}
+			}
+			if (opt) return ci;
+		}
+		// Mirror matchOptions' fallbacks: single-pick steps trust the text
+		// match regardless of number, but only before the pick is made (so a
+		// returning menu doesn't re-trigger it); chains re-sync on a strong
+		// unique match.
+		var real = [];
+		cands.forEach(function (c, i) { if (!/^any$/i.test(c)) real.push(i); });
+		if (real.length === 1) {
+			return (!(candidateStart > 0) && bestOptionFor(cands[real[0]], scanOpts, true)) ? real[0] : -1;
+		}
+		var fb = bestChainMatch(cands, scanOpts, candidateStart);
+		return fb ? fb.ci : -1;
+	}
+
+	// Alt1's readers only match the interface pixel-for-pixel. When neither
+	// the chatbox nor any dialogue has been recognised for a while, say so
+	// instead of failing silently â€” but don't overclaim: on standard setups
+	// the usual culprit is a fully transparent chat window, and dialogue
+	// highlighting can still work even when the chatbox is unreadable
+	// (Reddit report: 1080p, 100% scale, warning blamed the scale).
+	function scaleHintText(chatMisses, anyChatFound, anyDialogFound) {
+		if (anyChatFound || anyDialogFound || chatMisses < 8) return "";
+		return " âš  Alt1 hasn't recognised your chatbox yet. Common causes: a fully " +
+			"transparent chat window (give it an opaque background), or interface " +
+			"scale not at 100% (graphics settings). Dialogue highlighting may still " +
+			"work when a conversation opens â€” the guide and overlay always work.";
+	}
+
+	var chatScanMisses = 0;
+	var dialogEverFound = false;
+
+	// Boxing EVERY option is never helpful: either the guide says "Any"
+	// (any choice progresses â€” words beat a wall of green) or a text
+	// candidate failed to match (bad capture/OCR, wrong screen) and the
+	// Any fallback swallowed the whole screen (Reddit report: "selects
+	// every chat option in green"). The auto-tick evidence is unaffected â€”
+	// this only decides what gets DRAWN.
+	function allOptionsMatched(matches, opts) {
+		return opts.length >= 2 && matches.length === opts.length;
+	}
+
+	function setAssistStatus(msg) {
+		var node = document.getElementById("assist-status");
+		if (msg) msg += scaleHintText(chatScanMisses, chatFound, dialogEverFound);
+		node.textContent = msg || "";
+		node.classList.toggle("hidden", !msg);
+	}
+
+	function clearAssistOverlay() {
+		if (!inAlt1() || !alt1.permissionOverlay) return;
+		try {
+			alt1.overLaySetGroup("rs3qh-assist");
+			alt1.overLayClearGroup("rs3qh-assist");
+			alt1.overLayRefreshGroup("rs3qh-assist");
+		} catch (e) { /* ignore */ }
+	}
+
+	// Alt1 image overlays cannot blend with the game (semi-transparent
+	// pixels composite against black and cover whatever is underneath), so
+	// the highlight is built from outline primitives that leave the option
+	// text untouched: a "neon" border â€” dim outer ring, bright core, dim
+	// inner ring â€” plus a chevron pointing at the choice. Pure geometry so
+	// it can be tested headless; drawOptionBoxes renders it.
+	var HL_BRIGHT = mixColor(141, 255, 90);
+	var HL_DIM = mixColor(52, 110, 34);
+
+	// Find the dark option button inside a crop centred on the OCR'd text
+	// row, so the highlight hugs the real button instead of guessing its
+	// size from text length. RS3 buttons are near-black bars on parchment;
+	// their light glyphs only poke small holes in the darkness. Returns
+	// {x, y, w, h} relative to the crop, or null when nothing button-like
+	// is there (legacy skin draws plain text â€” the caller falls back).
+	function measureOptionButton(crop) {
+		var w = crop.width, h = crop.height, d = crop.data;
+		function dark(px, py) {
+			var i = (py * w + px) * 4;
+			return d[i] + d[i + 1] + d[i + 2] < 250;
+		}
+		var mid = Math.floor(h / 2);
+		var probes = [mid - 4, mid, mid + 4];
+		function anyDark(px) {
+			for (var r = 0; r < probes.length; r++) if (dark(px, probes[r])) return true;
+			return false;
+		}
+		// Horizontal extent: a >=3px dark run from either side marks the
+		// button caps (single dark specks on parchment don't count).
+		var left = -1, right = -1, run = 0, px;
+		for (px = 0; px < w; px++) {
+			run = anyDark(px) ? run + 1 : 0;
+			if (run >= 3) { left = px - 2; break; }
+		}
+		run = 0;
+		for (px = w - 1; px >= 0; px--) {
+			run = anyDark(px) ? run + 1 : 0;
+			if (run >= 3) { right = px + 2; break; }
+		}
+		if (left < 0 || right - left < 60) return null;
+		// Vertical extent: grow from the middle row while rows stay mostly
+		// dark, so a neighbouring option at the crop's edge is never
+		// swallowed (the parchment gap between buttons stops the growth).
+		function rowDark(py) {
+			var cnt = 0, tot = 0;
+			for (var qx = left; qx <= right; qx += 4) { tot++; if (dark(qx, py)) cnt++; }
+			return cnt / tot > 0.45;
+		}
+		if (!rowDark(mid)) return null;
+		var top = mid, bottom = mid;
+		while (top > 0 && rowDark(top - 1)) top--;
+		while (bottom < h - 1 && rowDark(bottom + 1)) bottom++;
+		if (bottom - top < 8) return null;
+		return { x: left, y: top, w: right - left + 1, h: bottom - top + 1 };
+	}
+	function highlightShapes(x, y, w, h) {
+		var cy = Math.round(y + h / 2);
+		return [
+			{ kind: "rect", color: HL_DIM, x: x - 3, y: y - 3, w: w + 6, h: h + 6, lw: 1 },
+			{ kind: "rect", color: HL_BRIGHT, x: x - 1, y: y - 1, w: w + 2, h: h + 2, lw: 2 },
+			{ kind: "rect", color: HL_DIM, x: x + 1, y: y + 1, w: w - 2, h: h - 2, lw: 1 },
+			{ kind: "line", color: HL_BRIGHT, lw: 3, x1: x + 8, y1: cy - 5, x2: x + 14, y2: cy },
+			{ kind: "line", color: HL_BRIGHT, lw: 3, x1: x + 14, y1: cy, x2: x + 8, y2: cy + 5 }
+		];
+	}
+
+	function drawOptionBoxes(matches, dialogPos, img) {
+		try {
+			alt1.overLaySetGroup("rs3qh-assist");
+			alt1.overLayFreezeGroup("rs3qh-assist");
+			alt1.overLayClearGroup("rs3qh-assist");
+			// Short-lived boxes: if the dialogue changes and the next tick
+			// doesn't reconfirm them, they expire on their own instead of
+			// lingering over whatever replaced the options.
+			var ttl = ASSIST_INTERVAL_MS + 250;
+			matches.forEach(function (o) {
+				// Best case: measure the actual button from the capture so
+				// the highlight hugs it exactly.
+				var box = null;
+				if (img && dialogPos && dialogPos.width) {
+					try {
+						var cx0 = dialogPos.x + 6, cy0 = o.y - 14;
+						var mb = measureOptionButton(img.toData(cx0, cy0, dialogPos.width - 12, 28));
+						if (mb) box = { x: cx0 + mb.x, y: cy0 + mb.y, w: mb.w, h: mb.h };
+					} catch (e3) { /* capture crop failed â€” fall through */ }
+				}
+				if (!box) {
+					// Fallback: size the box from the OCR'd text length
+					// (~8px/char mono font) plus room for the number and
+					// arrows. RS3 centres option buttons in the dialogue;
+					// legacy mode left-aligns them.
+					var textw = ((o.text || "").length * 8) + 120;
+					var x, w;
+					if (dialogPos && dialogPos.width && !dialogPos.legacy) {
+						w = Math.min(Math.max(textw, 170), dialogPos.width - 16);
+						x = dialogPos.x + Math.round((dialogPos.width - w) / 2);
+					} else if (dialogPos && dialogPos.width) {
+						w = Math.min(Math.max(textw, 170), dialogPos.width - 16);
+						x = Math.max(o.x - 50, dialogPos.x + 8);
+					} else {
+						x = (o.buttonx || o.x - 4) - 2;
+						w = Math.max(textw, 260);
+					}
+					box = { x: x, y: o.y - 10, w: w, h: 26 };
+				}
+				highlightShapes(box.x, box.y, box.w, box.h).forEach(function (s) {
+					if (s.kind === "rect") {
+						alt1.overLayRect(s.color, s.x, s.y, s.w, s.h, ttl, s.lw);
+					} else if (typeof alt1.overLayLine === "function") {
+						alt1.overLayLine(s.color, s.lw, s.x1, s.y1, s.x2, s.y2, ttl);
+					}
+				});
+			});
+			alt1.overLayRefreshGroup("rs3qh-assist");
+		} catch (e) { /* overlay unavailable */ }
+	}
+
+	function markQuestComplete() {
+		if (!guide) return;
+		var changed = false;
+		flatSteps.forEach(function (s) {
+			if (!isDone(s)) { questProgress().done[stepKey(s)] = true; changed = true; }
+			(s.subs || []).forEach(function (_, k) {
+				if (!isSubDone(s, k)) { questProgress().done[subKey(s, k)] = true; changed = true; }
+			});
+		});
+		if (changed) {
+			store(PROGRESS_KEY, progress);
+			renderSteps();
+			if (overlayTimer) paintOverlay();
+			setAssistStatus("Quest completion detected in chat â€” all steps marked done.");
+		}
+	}
+
+	function assistTick() {
+		if (!guide) { setAssistStatus(""); return; }
+		if (alt1.rsLinked === false) { clearAssistOverlay(); return; }
+		assistTickN++;
+		var img;
+		try {
+			img = A1lib.captureHoldFullRs();
+		} catch (e) {
+			setAssistStatus("Assist: could not capture the game screen.");
+			return;
+		}
+
+		// Watch the chatbox for quest completion (heavier OCR â€” every 4th tick).
+		try {
+			if (chatReader && assistTickN % CHAT_EVERY === 0) {
+				if (!chatFound) {
+					var boxes = chatReader.find(img);
+					chatFound = !!(boxes && boxes.length);
+					if (!chatFound) chatScanMisses++;
+				}
+				if (chatFound) {
+					var lines = chatReader.read(img) || [];
+					for (var i = 0; i < lines.length; i++) {
+						if (/congratulations.*(complete|finish)|quest complete/i.test(lines[i].text)) {
+							markQuestComplete();
+						}
+					}
+				}
+			}
+		} catch (e) { /* chat reading is best-effort */ }
+
+		// Highlight dialogue options for the current step and its unchecked
+		// sub-steps; auto-tick whichever one the finished conversation was for.
+		var step = currentStep();
+		var targets = step ? assistTargets(step, function (k) { return isSubDone(step, k); }) : [];
+		if (!step || !targets.length) {
+			clearAssistOverlay();
+			setAssistStatus("Assist: on â€” current step has no dialogue options" + (chatFound ? "; watching chat." : "."));
+			return;
+		}
+		try {
+			var pos = dialogReader.find(img);
+			// Local diagnostic patch: expose repeated detector misses in the UI.
+			// This does not change recognition or click/select dialogue options.
+			window.__rs3qhDialogDiag = window.__rs3qhDialogDiag || { ticks: 0, misses: 0, hits: 0 };
+			window.__rs3qhDialogDiag.ticks++;
+			if (pos) window.__rs3qhDialogDiag.hits++;
+			else window.__rs3qhDialogDiag.misses++;
+			if (pos) dialogEverFound = true;
+
+			// Read the dialogue and match options against the step targets
+			// FIRST â€” the result doubles as auto-tick evidence.
+			var dlg = null;
+			var allMatches = [];
+			var matchedTarget = null;
+			var matchedStart = 0;
+			if (pos) {
+				dlg = dialogReader.read(img);
+				if (dlg && dlg.opts && dlg.opts.length) {
+					var scrIdx = screenIndexFor(stepKey(step), dlg.opts);
+					targets.forEach(function (t) {
+						// Pick only the first valid target (sub-steps take priority).
+						if (matchedTarget || dialogTitleConflicts(t, dlg.title)) return;
+						var start = optScreen.nextCand[t.optionKey] || 0;
+						// Guides enumerating 1..N choices sometimes require one
+						// separate conversation for EACH choice. Move forward after
+						// each completed conversation, instead of boxing #1 again.
+						if (t.subIndex === null && requiredConversations(t.chat) > 1 &&
+							convo.key === stepKey(step)) {
+							start = Math.max(start, convo.completions);
+						}
+						var m = matchOptions(t.chat, dlg.opts, scrIdx, start);
+						if (m.length) {
+							matchedTarget = t;
+							matchedStart = start;
+							// The explicit 'Any' fallback means any choice works:
+							// show the existing text notice rather than many boxes.
+							allMatches = m.length === dlg.opts.length ? m : [m[0]];
+						}
+					});
+					if (matchedTarget) {
+						optScreen.matchedCand = matchedCandIndex(matchedTarget.chat, dlg.opts, scrIdx,
+							matchedStart);
+						optScreen.matchedTarget = matchedTarget.optionKey;
+					}
+				} else if (dlg && dlg.text) {
+					// A selected answer normally opens a response screen before
+					// returning to its options. Count that transition even if the
+					// returning menu is byte-for-byte identical (Red Raktuber).
+					screenIndexNoOptions();
+				}
+			}
+
+			// Auto-tick only with evidence: the conversation that just
+			// ended must have shown one of this step's expected options.
+			// Sampled every 2nd tick so convoObserve's seen/gone tick
+			// thresholds keep their original 700ms-cadence timing.
+			if (autoAdvance && assistTickN % CONVO_EVERY === 0) {
+				var reqConv = 1;
+				var seq = null;
+				if (matchedTarget && matchedTarget.subIndex === null) {
+					reqConv = requiredConversations(matchedTarget.chat);
+					// Gate only single-conversation, multi-pick parent chains:
+					// require the LAST pick before ticking so a mid-chain
+					// vanish (Rune Memories' quest-offer window) can't finish
+					// the step early. Enumerated (multi-conversation) steps and
+					// single picks are left exactly as before.
+					if (reqConv === 1 && dlg && dlg.opts && dlg.opts.length) {
+						var lastCand = lastMatchableCand(matchedTarget.chat);
+						if (lastCand >= 1) {
+							seq = { index: matchedCandIndex(matchedTarget.chat, dlg.opts, scrIdx,
+								matchedStart),
+								last: lastCand };
+						}
+					}
+				}
+				var res = convoObserve(stepKey(step), !!pos,
+					matchedTarget ? { key: stepKey(step), subIndex: matchedTarget.subIndex } : null, reqConv, seq);
+				if (res) {
+					clearAssistOverlay();
+					if (res.held) {
+						setAssistStatus("Assist: conversation paused mid-chain (" + res.reached + "/" +
+							res.total + " picks) â€” waiting for it to continue before ticking.");
+					} else if (res.none) {
+						setAssistStatus("Assist: a conversation ended, but this step's options never appeared â€” not ticked (tick manually if it was the right one).");
+					} else if (res.partial) {
+						setAssistStatus("Assist: conversation done â€” " + res.partial + "/" + res.required +
+							" of this step's dialogue options completed. Talk again for the next one.");
+					} else if (res.subIndex !== null && res.subIndex !== undefined) {
+						setSubDone(step, res.subIndex, true);
+						setAssistStatus("Assist: conversation finished â€” sub-step ticked automatically.");
+						return;
+					} else if (autoTickBlockedBySubs(step, function (k) { return isSubDone(step, k); })) {
+						// Hold only for unticked sub-steps that have their OWN
+						// dialogue (separate conversations still to do). A
+						// chatless sub is an informational note (Rune Mysteries'
+						// "the options you pick only dictate the title") â€” it
+						// shouldn't block completion, and setDone's cascade
+						// ticks it along with the step.
+						setAssistStatus("Assist: conversation finished â€” but this step has unticked dialogue sub-steps, so it was not completed automatically.");
+					} else {
+						setDone(step, true);
+						setAssistStatus("Assist: conversation finished â€” step ticked automatically.");
+						return;
+					}
+				}
+			}
+
+			if (!pos) {
+				screenIndexGone();
+				clearAssistOverlay();
+				if (!autoAdvance || !convo.gone) {
+					setAssistStatus("Assist: waiting | corners " + JSON.stringify(window.__rs3qhCorners || {}) + " | misses " + window.__rs3qhDialogDiag.misses + " | hits " + window.__rs3qhDialogDiag.hits + " | target: " +
+						targets.map(function (t) { return t.chat; }).join(" | "));
+				}
+				return;
+			}
+			if (!dlg || !dlg.opts || !dlg.opts.length) {
+				clearAssistOverlay();
+				setAssistStatus("Assist: dialogue frame detected, but no options readable | button candidates: " + (window.__rs3qhOptionCount == null ? "unknown" : window.__rs3qhOptionCount) + (window.__rs3qhOptionError ? " | button error: " + window.__rs3qhOptionError : "") + ".");
+				return;
+			}
+			if (allMatches.length && allOptionsMatched(allMatches, dlg.opts)) {
+				clearAssistOverlay();
+				setAssistStatus("Assist: any option works on this screen â€” pick whichever you like.");
+			} else if (allMatches.length) {
+				drawOptionBoxes(allMatches, pos, img);
+				setAssistStatus("Assist: highlighted \"" +
+					(allMatches[0].text || ("option " + (dlg.opts.indexOf(allMatches[0]) + 1))) + "\"" +
+					(matchedTarget.subIndex !== null ? " (sub-step)" : ""));
+			} else {
+				clearAssistOverlay();
+				setAssistStatus("Assist: no option matched â€” read: " +
+					dlg.opts.map(function (o) { return o.text; }).join(" | "));
+			}
+		} catch (e) {
+			clearAssistOverlay();
+			setAssistStatus("Assist: dialogue read failed (" + (e && e.message ? e.message : "error") + ")");
+		}
+	}
+
+	function setAssist(on) {
+		var btn = document.getElementById("btn-assist");
+		if (assistTimer) { clearInterval(assistTimer); assistTimer = null; }
+		if (on) {
+			if (!dialogReader) dialogReader = new Dialog.default();
+			if (!chatReader && typeof Chatbox !== "undefined") chatReader = new Chatbox.default();
+			chatFound = false;
+			chatScanMisses = 0;
+			dialogEverFound = false;
+			convo.key = null;
+			convo.evidence = null;
+			optScreen.key = null;
+			assistTickN = 0;
+			assistTimer = setInterval(assistTick, ASSIST_INTERVAL_MS);
+			assistTick();
+			btn.textContent = "Assist: on";
+			btn.classList.add("active");
+		} else {
+			clearAssistOverlay();
+			setAssistStatus("");
+			btn.textContent = "Assist: off";
+			btn.classList.remove("active");
+		}
+	}
+
+	// ---------- item info popup (what is it, how to make, where to buy) ----------
+
+	var itemInfoCache = {};
+
+	// Pull the materials/skill out of an {{Infobox Recipe}} block.
+	function parseRecipe(wt) {
+		var idx = wt.search(/\{\{Infobox Recipe/i);
+		if (idx === -1) return null;
+		var depth = 0, end = -1;
+		for (var i = idx; i < wt.length - 1; i++) {
+			var two = wt.substr(i, 2);
+			if (two === "{{") { depth++; i++; }
+			else if (two === "}}") { depth--; i++; if (!depth) { end = i + 1; break; } }
+		}
+		if (end === -1) return null;
+		var parts = splitParams(wt.slice(idx + 2, end - 2));
+		function clean(v) { return v ? extractChat(cleanMarkup(resolveTemplates(v))).text : ""; }
+		var mats = [];
+		for (var m = 1; m <= 12; m++) {
+			var mat = namedParam(parts, "mat" + m);
+			if (!mat) break;
+			var q = namedParam(parts, "mat" + m + "quantity") || namedParam(parts, "mat" + m + "qty") || "1";
+			mats.push(clean(q) + "Ã— " + clean(mat));
+		}
+		if (!mats.length) return null;
+		var skill = clean(namedParam(parts, "skill1") || namedParam(parts, "skill") || "");
+		var lvl = clean(namedParam(parts, "skill1lvl") || namedParam(parts, "level") || "");
+		return { mats: mats, skill: skill, level: lvl };
+	}
+
+	// Turn a rendered shop-locations section into rows of
+	// { text: "Seller â€” Location â€” price", page: "Shop article title" }.
+	function parseShopRows(html) {
+		var rows = [];
+		try {
+			var doc = new DOMParser().parseFromString(html, "text/html");
+			var table = doc.querySelector("table");
+			if (!table) return rows;
+			var trs = table.querySelectorAll("tr");
+			for (var i = 1; i < trs.length && rows.length < 5; i++) {
+				var cells = trs[i].querySelectorAll("td");
+				if (!cells.length) continue;
+				var texts = [];
+				for (var c = 0; c < Math.min(cells.length, 2); c++) {
+					var t = cells[c].textContent.replace(/\s+/g, " ").trim();
+					if (t) texts.push(t);
+				}
+				// Sell price column (position 3) when the table has one.
+				if (cells.length > 3) {
+					var price = cells[3].textContent.replace(/\s+/g, " ").trim();
+					if (price) texts.push(price);
+				}
+				if (!texts.length) continue;
+				var row = { text: texts.join(" â€” "), page: null };
+				var a = cells[0].querySelector("a[title]");
+				if (a) row.page = a.getAttribute("title");
+				if (cells.length > 5 && /member/i.test(cells[5].textContent)) row.text += " (members)";
+				// Location-implied unlocks (buildable camps, gated cities).
+				if (cells.length > 1) row.lock = locationLockNote(cells[1].textContent);
+				rows.push(row);
+			}
+		} catch (e) { /* tolerate table changes */ }
+		return rows;
+	}
+
+	// First sentence of a shop's intro that hints at an unlock requirement.
+	function questLockNote(extract) {
+		if (!extract) return null;
+		var sentences = extract.split(". ");
+		for (var i = 0; i < sentences.length; i++) {
+			if (/quest|requir|unlock|only (be )?(accessed|used|entered)|after (complet|start|build)|must (have|be)|(be )?built|constructed/i.test(sentences[i])) {
+				var s = sentences[i].trim();
+				if (s && !/\.$/.test(s)) s += ".";
+				return s.length > 160 ? s.slice(0, 157) + "â€¦" : s;
+			}
+		}
+		return null;
+	}
+
+	// Some shop locations imply an unlock by themselves (buildable camps,
+	// quest-gated cities) even when the shop's own page never says so.
+	var GATED_LOCATIONS = [
+		[/anachronia|base camp/i, "Anachronia base camp â€” the shop's building must be constructed at your camp first."],
+		[/fort forinthry/i, "Fort Forinthry â€” the relevant building must be constructed (New Foundations)."],
+		[/prifddinas/i, "Prifddinas â€” requires completing Plague's End."],
+		[/zanaris/i, "Zanaris â€” requires Lost City."],
+		[/sophanem/i, "Sophanem â€” requires starting Icthlarin's Little Helper."],
+		[/menaphos/i, "Menaphos â€” requires The Jack of Spades."],
+		[/keldagrim/i, "Keldagrim â€” requires starting The Giant Dwarf."],
+		[/dorgesh-kaan/i, "Dorgesh-Kaan â€” requires Death to the Dorgeshuun."],
+		[/lletya/i, "Lletya â€” requires starting Mourning's End Part I."],
+		[/miscellania|etceteria/i, "Miscellania â€” requires The Fremennik Trials."],
+		[/mos le'harmless/i, "Mos Le'Harmless â€” requires Cabin Fever."],
+		[/ape atoll|marim/i, "Ape Atoll â€” requires Monkey Madness."],
+		[/oo'glog/i, "Oo'glog â€” requires As a First Resort."],
+		[/city of um/i, "City of Um â€” requires the Necromancy! questline."]
+	];
+
+	function locationLockNote(location) {
+		if (!location) return null;
+		for (var i = 0; i < GATED_LOCATIONS.length; i++) {
+			if (GATED_LOCATIONS[i][0].test(location)) return GATED_LOCATIONS[i][1];
+		}
+		return null;
+	}
+
+	function renderItemInfo(name, info) {
+		var body = document.getElementById("item-popup-body");
+		body.innerHTML = "";
+		if (info.intro) body.appendChild(el("p", null, info.intro));
+		if (info.recipe) {
+			body.appendChild(el("div", "req-head", "How to make"));
+			body.appendChild(el("p", null, info.recipe.mats.join(", ") +
+				(info.recipe.skill ? " (" + info.recipe.skill + (info.recipe.level ? " level " + info.recipe.level : "") + ")" : "")));
+		}
+		if (info.shops && info.shops.length) {
+			body.appendChild(el("div", "req-head", "Sold by"));
+			var ul = el("ul", null);
+			info.shops.forEach(function (s) {
+				var li = el("li", null, s.text);
+				if (s.lock) li.appendChild(el("div", "shop-lock", "âš  " + s.lock));
+				ul.appendChild(li);
+			});
+			body.appendChild(ul);
+		}
+		if (!info.intro && !info.recipe && (!info.shops || !info.shops.length)) {
+			body.appendChild(el("p", null, "No summary available â€” use the full wiki page link above."));
+		}
+	}
+
+	function showItemInfo(name) {
+		var popup = document.getElementById("item-popup");
+		document.getElementById("item-popup-title").textContent = name;
+		document.getElementById("item-popup-link").href =
+			"https://runescape.wiki/w/" + encodeURIComponent(name.replace(/ /g, "_"));
+		document.getElementById("item-popup-body").textContent = "Loading from the wikiâ€¦";
+		popup.classList.remove("hidden");
+		if (itemInfoCache[name]) { renderItemInfo(name, itemInfoCache[name]); return; }
+
+		var info = { intro: "", recipe: null, shops: [] };
+		function finish() {
+			itemInfoCache[name] = info;
+			// Only render if this item is still the one being shown.
+			if (document.getElementById("item-popup-title").textContent === name) {
+				renderItemInfo(name, info);
+			}
+		}
+		wikiGet({ action: "query", prop: "extracts", exintro: "1", explaintext: "1", redirects: "1", titles: name }, function (d) {
+			try {
+				var pages = d.query.pages;
+				var ext = pages[Object.keys(pages)[0]].extract || "";
+				info.intro = ext.split("\n")[0];
+			} catch (e) { /* no extract */ }
+			wikiGet({ action: "parse", page: name, prop: "sections", redirects: "1" }, function (sd) {
+				var secs = (sd.parse && sd.parse.sections) || [];
+				var creation = null, shop = null;
+				secs.forEach(function (s) {
+					if (!creation && /creation|making/i.test(s.line)) creation = s;
+					if (!shop && /shop|store/i.test(s.line)) shop = s;
+				});
+				var pending = 1;
+				function done() { if (--pending === 0) finish(); }
+				if (creation) {
+					pending++;
+					wikiGet({ action: "parse", page: name, prop: "wikitext", section: creation.index, redirects: "1" }, function (cd) {
+						try { info.recipe = parseRecipe(cd.parse.wikitext["*"]); } catch (e) { /* none */ }
+						done();
+					}, done);
+				}
+				if (shop) {
+					pending++;
+					wikiGet({ action: "parse", page: name, prop: "text", section: shop.index, redirects: "1" }, function (td) {
+						try { info.shops = parseShopRows(td.parse.text["*"]); } catch (e) { /* none */ }
+						// Shops can be quest-locked; their own pages say so.
+						var titles = [];
+						info.shops.forEach(function (s) {
+							if (s.page && titles.indexOf(s.page) === -1) titles.push(s.page);
+						});
+						if (!titles.length) { done(); return; }
+						wikiGet({
+							action: "query", prop: "extracts", exintro: "1", explaintext: "1",
+							redirects: "1", titles: titles.slice(0, 15).join("|")
+						}, function (ed) {
+							try {
+								var pages = ed.query.pages;
+								var byTitle = {};
+								Object.keys(pages).forEach(function (k) {
+									byTitle[pages[k].title] = pages[k].extract || "";
+								});
+								info.shops.forEach(function (s) {
+									if (s.page && byTitle[s.page] !== undefined) {
+										// A note from the shop's own page wins, but
+										// never erase a location-implied one.
+										s.lock = questLockNote(byTitle[s.page]) || s.lock;
+									}
+								});
+							} catch (e) { /* extracts unavailable */ }
+							done();
+						}, done);
+					}, done);
+				}
+				done();
+			}, finish);
+		}, finish);
+	}
+
+	// ---------- backpack item scanning ----------
+	// Looks for the wiki inventory icon of each required item in the game
+	// screen (transparent icon pixels act as wildcards). Presence-only: it
+	// cannot count quantities, and the backpack must be open and visible.
+
+	var iconCache = {}; // item name -> ImageData | null (failed to load)
+
+	function itemIconUrl(name) {
+		return "https://runescape.wiki/w/Special:FilePath/" +
+			encodeURIComponent(name.replace(/ /g, "_")) + ".png";
+	}
+
+	// Stack sizes render over the icon's top-left corner; mask that region
+	// out so stackable items still match.
+	function maskStackCorner(img) {
+		for (var y = 0; y < Math.min(10, img.height); y++) {
+			for (var x = 0; x < Math.min(16, img.width); x++) {
+				img.data[(y * img.width + x) * 4 + 3] = 0;
+			}
+		}
+		return img;
+	}
+
+	function getItemIcon(name) {
+		if (name in iconCache) return Promise.resolve(iconCache[name]);
+		return A1lib.ImageDetect.imageDataFromUrl(itemIconUrl(name)).then(function (img) {
+			maskStackCorner(img);
+			// Nearly-black icons (e.g. charcoal) match any dark screen area,
+			// so their hits cannot be trusted.
+			var opaque = 0, bright = 0;
+			for (var i = 0; i < img.data.length; i += 4) {
+				if (img.data[i + 3] > 200) {
+					opaque++;
+					if (img.data[i] + img.data[i + 1] + img.data[i + 2] > 150) bright++;
+				}
+			}
+			iconCache[name] = { img: img, reliable: opaque >= 60 && bright >= 20 };
+			return iconCache[name];
+		}, function () {
+			iconCache[name] = null;
+			return null;
+		});
+	}
+
+	// Stack sizes render in the small pixel font at the top-left of the
+	// slot; read them to verify required amounts of stackable items. The
+	// matched icon is trimmed, so the number can sit anywhere up-left of
+	// the hit â€” search each stack colour over the whole area and at every
+	// baseline (same approach as the alt1 buffs reader).
+	function readStackNumber(imgref, pos) {
+		try {
+			var font = typeof Alt1Fonts !== "undefined" ? Alt1Fonts.pixel_8px_digits : null;
+			if (font && font.default) font = font.default;
+			if (!font || !OCR.findChar) return null;
+			var cols = [[255, 255, 0], [255, 255, 255], [0, 255, 128], [255, 165, 0]];
+			function tryRead(buf) {
+				// Prefer the longest digit run over any first hit â€” icon
+				// pixels (e.g. yellow fishing bait) can fake short digits.
+				var best = "";
+				for (var c = 0; c < cols.length; c++) {
+					var chr = OCR.findChar(buf, font, cols[c], 0, 6, buf.width - 10, buf.height - 12);
+					if (!chr) continue;
+					var r = OCR.readLine(buf, font, cols[c], chr.x, chr.y, true, true);
+					var digits = r && r.text ? r.text.replace(/[^0-9]/g, "") : "";
+					if (digits.length > best.length) best = digits;
+				}
+				return best;
+			}
+			// Pass 1: the strip strictly above the icon, where the number
+			// lives â€” this keeps the icon's own pixels out of the read.
+			var d = tryRead(imgref.toData(Math.max(0, pos.x - 24), Math.max(0, pos.y - 26), 84, 30));
+			// Pass 2 (fallback): a taller region in case the icon is
+			// trimmed low in its slot.
+			if (!d) d = tryRead(imgref.toData(Math.max(0, pos.x - 24), Math.max(0, pos.y - 26), 84, 44));
+			return d ? parseInt(d, 10) : null;
+		} catch (e) {
+			return null;
+		}
+	}
+
+	// Linked pages in Needed lines that are not scannable backpack items.
+	var NON_ITEMS = ["backpack", "bank", "tool belt", "lodestone", "grand exchange", "combat", "quick guide"];
+
+	// The wiki's quest page lists only the items you must BRING; anything the
+	// quick guide references but the quest page omits is obtained during the
+	// quest (Holy Grail's magic whistle). Returns false for such items so the
+	// overview can flag them â€” but only once the quest-page list has loaded,
+	// so nothing is mislabelled while it's still fetching.
+	function itemIsRequired(name) {
+		var items = guide && guide.details && guide.details.items;
+		if (!items || !items.length) return true;
+		var n = normOpt(name);
+		if (!n) return true;
+		return items.some(function (it) {
+			return normOpt(typeof it === "string" ? it : it.text || "").indexOf(n) !== -1;
+		});
+	}
+
+	function currentItemNames() {
+		if (!guide) return [];
+		var seen = {};
+		var list = [];
+		guide.sections.forEach(function (s) {
+			(s.items || []).forEach(function (it) {
+				var k = it.name.toLowerCase();
+				if (NON_ITEMS.indexOf(k) !== -1) return;
+				if (seen[k] === undefined) {
+					seen[k] = list.length;
+					list.push({ name: it.name, qty: it.qty || 1 });
+				} else {
+					list[seen[k]].qty = Math.max(list[seen[k]].qty, it.qty || 1);
+				}
+			});
+		});
+		return list;
+	}
+
+	function scanBackpack() {
+		var items = currentItemNames();
+		var status = document.getElementById("scan-status");
+		if (!items.length) { status.textContent = "This guide lists no linked items."; return; }
+		if (!inAlt1() || !alt1.permissionPixel) {
+			status.textContent = "Scanning needs Alt1 with the pixel permission.";
+			return;
+		}
+		status.textContent = "Loading iconsâ€¦";
+		Promise.all(items.map(function (it) { return getItemIcon(it.name); })).then(function (icons) {
+			status.textContent = "Scanningâ€¦";
+			var img;
+			try {
+				img = A1lib.captureHoldFullRs();
+			} catch (e) {
+				status.textContent = "Could not capture the game screen.";
+				return;
+			}
+			var okCount = 0, total = 0, anyHit = false;
+			items.forEach(function (it, i) {
+				var mark = document.querySelector('[data-scan-item="' + i + '"]');
+				var countEl = document.querySelector('[data-scan-count="' + i + '"]');
+				function set(sym, cls, title, count) {
+					if (mark) { mark.textContent = sym; mark.className = "scan-mark " + cls; mark.title = title; }
+					if (countEl) countEl.textContent = count || "";
+					// A confirmed requirement ticks the item's checkbox; a
+					// failed scan never un-ticks a manual check (failsafe).
+					if (cls === "ok") {
+						setItemChecked(it.name, true);
+						var box = document.querySelector('[data-scan-box="' + i + '"]');
+						if (box) {
+							box.checked = true;
+							box.parentElement.classList.add("done");
+						}
+					}
+				}
+				if (!icons[i]) {
+					set("?", "unknown", "Could not load this item's icon");
+					return;
+				}
+				total++;
+				var qty = it.qty || 1;
+				var hits = [];
+				try { hits = img.findSubimage(icons[i].img); } catch (e) { /* keep empty */ }
+				if (hits.length) anyHit = true;
+
+				if (!hits.length) {
+					set("âœ—", "missing", "Not visible â€” check your bank", qty > 1 ? "0/" + qty : "");
+				} else if (!icons[i].reliable) {
+					// e.g. charcoal: an all-dark icon matches any dark area.
+					set("~", "unknown", "Matched, but this icon is too dark/plain to detect reliably â€” check manually", "");
+				} else if (hits.length >= qty) {
+					okCount++;
+					set("âœ“", "ok", qty > 1 ? hits.length + " separate ones spotted" : "Spotted on screen", qty > 1 ? hits.length + "/" + qty : "");
+				} else {
+					// Fewer matches than required â€” probably a stack; read
+					// the stack size next to the first match.
+					var n = readStackNumber(img, hits[0]);
+					if (n === null) {
+						set("~", "unknown", "Found, but the stack amount was unreadable", "?/" + qty);
+					} else if (n >= qty) {
+						okCount++;
+						set("âœ“", "ok", n + " in stack", n + "/" + qty);
+					} else {
+						set("âœ—", "missing", "Stack too small: " + n + " of " + qty + " needed", n + "/" + qty);
+					}
+				}
+			});
+			var collected = 0;
+			items.forEach(function (it) { if (itemChecked(it.name)) collected++; });
+			status.textContent = collected + "/" + items.length + " collected (" + okCount +
+				" confirmed by scan" + (collected > okCount ? ", " + (collected - okCount) + " ticked manually" : "") +
+				"). Backpack must be open and visible." +
+				// Zero matches across every icon points at a scaled interface
+				// rather than an empty backpack.
+				(total > 0 && !anyHit
+					? " âš  Nothing matched at all â€” if your in-game interface scale isn't 100% (graphics settings), Alt1 can't recognise item icons."
+					: "");
+		});
+	}
+
+	// ---------- step logic ----------
+
+	function stepKey(step) {
+		return step.sectionIndex + ":" + step.stepIndex;
+	}
+
+	function subKey(step, k) {
+		return stepKey(step) + ":" + k;
+	}
+
+	function isDone(step) {
+		return !!questProgress().done[stepKey(step)];
+	}
+
+	function isSubDone(step, k) {
+		return !!questProgress().done[subKey(step, k)];
+	}
+
+	// Whether finishing all sub-steps may auto-complete the parent step.
+	function subCascadeAllowed(step) {
+		return (step.subs || []).length >= 2 && !step.chat;
+	}
+
+	function setSubDone(step, k, done) {
+		var p = questProgress();
+		if (done) p.done[subKey(step, k)] = true;
+		else delete p.done[subKey(step, k)];
+		// Completing every sub-step completes the step itself â€” but only
+		// when the sub-steps plausibly ARE the whole step. A single
+		// sub-bullet is usually a side note (item preparation etc.), and a
+		// parent with its own chat options still has its own conversation
+		// to do, so neither cascades upward. Un-ticking a sub always
+		// re-opens a step that had been completed.
+		var subs = step.subs || [];
+		var allDone = subs.length > 0;
+		for (var i = 0; i < subs.length; i++) {
+			if (!isSubDone(step, i)) { allDone = false; break; }
+		}
+		if (allDone && subCascadeAllowed(step)) p.done[stepKey(step)] = true;
+		else if (!done) delete p.done[stepKey(step)];
+		store(PROGRESS_KEY, progress);
+		renderSteps();
+		if (overlayTimer) paintOverlay();
+	}
+
+	function currentStep() {
+		for (var i = 0; i < flatSteps.length; i++) {
+			if (!isDone(flatSteps[i])) return flatSteps[i];
+		}
+		return null;
+	}
+
+	function allStepsDone() {
+		return flatSteps.length > 0 && flatSteps.every(isDone);
+	}
+
+	// After a user completes the final step, give a brief heads-up and return
+	// to the quest list. Guarded so repeated clicks don't stack timers.
+	var finishingQuest = false;
+	function maybeFinishQuest() {
+		if (finishingQuest || !guide || !allStepsDone()) return;
+		finishingQuest = true;
+		setStatus("guide-status", "ðŸŽ‰ " + guide.name + " complete! Returning to the quest listâ€¦");
+		setTimeout(function () {
+			finishingQuest = false;
+			if (allStepsDone()) goHome();
+			else setStatus("guide-status", "");
+		}, 1800);
+	}
+
+	function setDone(step, done) {
+		var p = questProgress();
+		if (done) p.done[stepKey(step)] = true;
+		else delete p.done[stepKey(step)];
+		// Ticking a step cascades to its sub-steps either way.
+		(step.subs || []).forEach(function (_, k) {
+			if (done) p.done[subKey(step, k)] = true;
+			else delete p.done[subKey(step, k)];
+		});
+		store(PROGRESS_KEY, progress);
+		renderSteps();
+		if (overlayTimer) paintOverlay();
+	}
+
+	// Whether a quest guide is on screen, so an advance/hotkey has a step to
+	// act on. Null-safe on the element so it's callable under test.
+	function guideVisible() {
+		var gv = document.getElementById("view-guide");
+		return !!guide && (!gv || !gv.classList.contains("hidden"));
+	}
+
+	// Complete the current step. Returns whether one was actually ticked.
+	function advanceStep(fromHotkey) {
+		if (!guideVisible()) return false;
+		var cur = currentStep();
+		if (!cur) return false;
+		setDone(cur, true);
+		// Pressed from inside the game (Alt1 hotkey): confirm on-screen so the
+		// player knows it registered without looking at the app.
+		if (fromHotkey) flashOverlayText(allStepsDone() ? "âœ“ Quest complete!" : "âœ“ Step done");
+		maybeFinishQuest();
+		return true;
+	}
+
+	// ---------- rendering ----------
+
+	function el(tag, className, text) {
+		var node = document.createElement(tag);
+		if (className) node.className = className;
+		if (text) node.textContent = text;
+		return node;
+	}
+
+	function mapUrl(m) {
+		return "https://mejrs.github.io/rs3?m=" + m.mapId + "&z=4&p=" + m.plane + "&x=" + m.x + "&y=" + m.y;
+	}
+
+	// Chip that opens the embedded world map panel at the step's spot.
+	function mapChip(m) {
+		var a = el("a", "chip chip-map", "Map " + m.x + "," + m.y);
+		a.href = mapUrl(m);
+		a.title = "Show this location on the world map";
+		a.addEventListener("click", function (e) {
+			e.preventDefault();
+			e.stopPropagation();
+			showMapPanel(m);
+		});
+		return a;
+	}
+
+	// Render text with its wiki-linked names (NPCs, places, items) as
+	// clickable spans opening the entity popup.
+	function appendLinkedText(container, text, links) {
+		var remaining = text || "";
+		(links || []).forEach(function (lk) {
+			var idx = remaining.indexOf(lk.label);
+			if (idx === -1) return;
+			if (idx > 0) container.appendChild(document.createTextNode(remaining.slice(0, idx)));
+			var span = el("span", "wiki-link", lk.label);
+			span.title = "Show info from the wiki";
+			span.addEventListener("click", function (e) {
+				e.stopPropagation();
+				showEntityInfo(lk.page);
+			});
+			container.appendChild(span);
+			remaining = remaining.slice(idx + lk.label.length);
+		});
+		if (remaining) container.appendChild(document.createTextNode(remaining));
+	}
+
+	var entityInfoCache = {};
+
+	// Popup for any wiki page: picture + intro (which states locations).
+	function showEntityInfo(page) {
+		var popup = document.getElementById("item-popup");
+		document.getElementById("item-popup-title").textContent = page;
+		document.getElementById("item-popup-link").href =
+			"https://runescape.wiki/w/" + encodeURIComponent(page.replace(/ /g, "_"));
+		var body = document.getElementById("item-popup-body");
+		body.textContent = "Loading from the wikiâ€¦";
+		popup.classList.remove("hidden");
+
+		function render(info) {
+			if (document.getElementById("item-popup-title").textContent !== page) return;
+			body.innerHTML = "";
+			if (info.image) {
+				var img = document.createElement("img");
+				img.src = info.image;
+				img.alt = page;
+				img.className = "entity-img";
+				img.loading = "lazy";
+				body.appendChild(img);
+			}
+			if (info.intro) body.appendChild(el("p", null, info.intro));
+			if (!info.image && !info.intro) {
+				body.appendChild(el("p", null, "No summary available â€” use the full wiki page link above."));
+			}
+			// A linked quest name gets a direct jump into its guide â€” this is
+			// what makes quest mentions in the Ironman pathway interactive.
+			var q = questIndex.find(function (x) {
+				return normName(x.name) === normName(page) || normName(x.title) === normName(page);
+			});
+			if (q) {
+				var jump = el("button", "open-quest-btn", "Open quest in helper â–¶");
+				jump.addEventListener("click", function () {
+					popup.classList.add("hidden");
+					openQuest(q.title);
+				});
+				body.appendChild(jump);
+			}
+		}
+
+		if (entityInfoCache[page]) { render(entityInfoCache[page]); return; }
+		wikiGet({
+			action: "query", prop: "extracts|pageimages", exintro: "1", explaintext: "1",
+			redirects: "1", pithumbsize: "260", titles: page
+		}, function (d) {
+			var info = { intro: "", image: null };
+			try {
+				var pages = d.query.pages;
+				var p = pages[Object.keys(pages)[0]];
+				info.intro = (p.extract || "").split("\n").slice(0, 2).join(" ");
+				if (p.thumbnail && p.thumbnail.source) info.image = p.thumbnail.source;
+			} catch (e) { /* keep defaults */ }
+			entityInfoCache[page] = info;
+			render(info);
+		}, function () {
+			render({ intro: "", image: null });
+		});
+	}
+
+	function wikiImageUrl(file, width) {
+		return "https://runescape.wiki/w/Special:FilePath/" +
+			encodeURIComponent(file.replace(/ /g, "_")) + (width ? "?width=" + width : "");
+	}
+
+	// Guide image (puzzle solutions etc.): thumbnail, click to enlarge.
+	function guideImage(im) {
+		var fig = el("figure", "guide-img");
+		var img = document.createElement("img");
+		img.src = wikiImageUrl(im.file, 320);
+		img.loading = "lazy";
+		img.alt = im.caption || im.file;
+		img.title = "Click to enlarge";
+		img.addEventListener("click", function (e) {
+			e.stopPropagation();
+			var big = fig.classList.toggle("expanded");
+			img.src = wikiImageUrl(im.file, big ? 1000 : 320);
+		});
+		fig.appendChild(img);
+		if (im.caption) fig.appendChild(el("figcaption", null, im.caption));
+		return fig;
+	}
+
+	function showMapPanel(m) {
+		var url = mapUrl(m);
+		document.getElementById("map-frame").src = url;
+		document.getElementById("map-label").textContent =
+			m.x + ", " + m.y + (m.plane ? " Â· floor " + m.plane : "");
+		document.getElementById("map-external").href = url;
+		show("map-panel", true);
+	}
+
+	function hideMapPanel() {
+		document.getElementById("map-frame").src = "about:blank";
+		show("map-panel", false);
+	}
+
+	function show(id, on) {
+		document.getElementById(id).classList.toggle("hidden", !on);
+	}
+
+	function setStatus(id, msg) {
+		var node = document.getElementById(id);
+		node.textContent = msg || "";
+		node.classList.toggle("hidden", !msg);
+	}
+
+	function doneCountFor(title) {
+		var p = progress[title];
+		return p ? Object.keys(p.done).length : 0;
+	}
+
+	function questStatus(q) {
+		return rmStatuses ? rmStatuses[normName(q.name)] || null : null;
+	}
+
+	// "Can do now": RuneMetrics says the requirements are met (userEligible)
+	// and it isn't already finished. Quests already in progress still count,
+	// since you can carry on with them.
+	function canDoNow(status, eligible) {
+		return eligible === true && status !== "COMPLETED";
+	}
+
+	// The rank map behind the current sort mode, if one applies and loaded.
+	function activeRank() {
+		if (prefs.sort === "optimal") return optimalRank;
+		if (prefs.sort === "timeline") return timelineRank;
+		return null;
+	}
+
+	function sortedIndex() {
+		var list = questIndex.slice();
+		var rank = activeRank();
+		if (rank) {
+			list.sort(function (a, b) {
+				var ra = rank[normName(a.name)], rb = rank[normName(b.name)];
+				if (ra === undefined && rb === undefined) return a.name.localeCompare(b.name);
+				if (ra === undefined) return 1;
+				if (rb === undefined) return -1;
+				return ra - rb;
+			});
+		}
+		return list;
+	}
+
+	function renderList() {
+		var filter = document.getElementById("search").value.trim().toLowerCase();
+		var main = document.getElementById("quest-list");
+		main.innerHTML = "";
+		var shown = 0, hidden = 0;
+		var rankMap = activeRank();
+		// Pinned special guide: the wiki's Efficient Ironman Pathway,
+		// browsable/checkable like a quest but not part of the quest index.
+		if ("efficient ironman pathway".indexOf(filter) !== -1) {
+			var prow = el("div", "quest-row pathway-row");
+			if (rankMap) prow.appendChild(el("span", "quest-rank", "â˜…"));
+			prow.appendChild(el("span", "quest-name", "Efficient Ironman Pathway"));
+			prow.appendChild(el("span", "quest-status", "guide"));
+			prow.addEventListener("click", function () { openQuest(PATHWAY_TITLE); });
+			main.appendChild(prow);
+		}
+		sortedIndex().forEach(function (q) {
+			if (filter && q.name.toLowerCase().indexOf(filter) === -1) return;
+			var status = questStatus(q);
+			if (prefs.hideDone && status === "COMPLETED") { hidden++; return; }
+			if (prefs.eligibleOnly && rmEligible &&
+				!canDoNow(status, rmEligible[normName(q.name)])) { hidden++; return; }
+			shown++;
+			var row = el("div", "quest-row");
+			if (rankMap) {
+				var rank = rankMap[normName(q.name)];
+				row.appendChild(el("span", "quest-rank", rank === undefined ? "â€”" : "#" + (rank + 1)));
+			}
+			row.appendChild(el("span", "quest-name", q.name));
+			if (status === "COMPLETED") {
+				row.appendChild(el("span", "quest-status done", "âœ“ done"));
+			} else if (status === "STARTED") {
+				row.appendChild(el("span", "quest-status started", "â–¶ in progress"));
+			} else {
+				var startedCount = doneCountFor(q.title);
+				if (startedCount) row.appendChild(el("span", "quest-progress", startedCount + " steps done"));
+			}
+			row.addEventListener("click", function () { openQuest(q.title); });
+			main.appendChild(row);
+		});
+		// The filter needs Jagex's eligibility flags, which only arrive with a
+		// RuneMetrics sync â€” say so rather than silently showing everything.
+		if (prefs.eligibleOnly && !rmEligible) {
+			main.appendChild(el("div", "status",
+				"\"Can do now\" needs your RuneMetrics data â€” enter your name above and hit Sync."));
+		}
+		if (!shown) {
+			main.appendChild(el("div", "status", filter ? "No quests match \"" + filter + "\"." :
+				hidden ? (prefs.eligibleOnly
+					? "No quests you can start right now â€” untick \"Can do now\" to see the rest."
+					: "All " + hidden + " matching quests are completed â€” untick \"Hide done\" to see them.")
+				: "Quest list is empty."));
+		}
+	}
+
+	function renderMeta() {
+		var info = document.getElementById("quest-info");
+		info.innerHTML = "";
+		var link = el("a", null, "Open wiki guide");
+		link.href = "https://runescape.wiki/w/" + encodeURIComponent(guide.title.replace(/ /g, "_"));
+		link.target = "_blank";
+		info.appendChild(link);
+
+		var allNeeded = [];
+		guide.sections.forEach(function (s) {
+			s.needed.forEach(function (n) { allNeeded.push(n); });
+		});
+		var itemsUl = document.getElementById("items-list");
+		itemsUl.innerHTML = "";
+		allNeeded.forEach(function (n) { itemsUl.appendChild(el("li", null, n)); });
+
+		var scanCount = renderScanList();
+		document.getElementById("scan-status").textContent = "";
+		show("items-panel", allNeeded.length > 0 || scanCount > 0);
+		// Open by default on every quest so requirements are not missed;
+		// the user can still collapse it.
+		document.getElementById("items-panel").open = true;
+	}
+
+	// Scannable items: exact wiki item names extracted from Needed lines, with
+	// the required amount when the guide gives one. Extracted here (not inline
+	// in renderMeta) so it can re-run once the quest page's required-items list
+	// arrives and the "obtained during quest" flags can be filled in. Returns
+	// the item count.
+	function renderScanList() {
+		var scanList = document.getElementById("scan-list");
+		scanList.innerHTML = "";
+		var items = currentItemNames();
+		items.forEach(function (it, i) {
+			var duringQuest = !itemIsRequired(it.name);
+			var li = el("li", "scan-item" + (itemChecked(it.name) ? " done" : "") + (duringQuest ? " during-quest" : ""));
+			var box = document.createElement("input");
+			box.type = "checkbox";
+			box.checked = itemChecked(it.name);
+			box.tabIndex = -1;
+			box.setAttribute("data-scan-box", i);
+			li.appendChild(box);
+			var mark = el("span", "scan-mark", "Â·");
+			mark.setAttribute("data-scan-item", i);
+			li.appendChild(mark);
+			li.appendChild(document.createTextNode(" " + (it.qty > 1 ? it.qty + "Ã— " : "") + it.name + " "));
+			// The wiki keeps quest-obtained items out of "required" â€” say so, so
+			// the list matches what you actually need to bring.
+			if (duringQuest) li.appendChild(el("span", "during-quest-tag", "obtained during quest"));
+			var count = el("span", "scan-count");
+			count.setAttribute("data-scan-count", i);
+			li.appendChild(count);
+			var infoChip = el("a", "chip chip-info", "â„¹");
+			infoChip.href = "#";
+			infoChip.title = "How to get this item (wiki summary)";
+			infoChip.addEventListener("click", function (e) {
+				e.preventDefault();
+				e.stopPropagation();
+				showItemInfo(it.name);
+			});
+			li.appendChild(infoChip);
+			// Manual tick as a failsafe for anything the scanner gets wrong.
+			li.addEventListener("click", function () {
+				var now = !itemChecked(it.name);
+				setItemChecked(it.name, now);
+				box.checked = now;
+				li.classList.toggle("done", now);
+			});
+			scanList.appendChild(li);
+		});
+		return items.length;
+	}
+
+	// Bring the current step to the top of the list (with a little context
+	// above). The formula is relative to the live layout, so calling it again
+	// after the layout changes re-lands on the same spot. When the current
+	// step is the FIRST of its section, scroll to the section heading instead
+	// so opening a quest (or advancing into a new section) shows the heading
+	// rather than scrolling it off â€” for the first section this lands at the
+	// very top.
+	// The element to bring to the top for a given current-step row: the step
+	// itself, unless it's the first of its section (only non-step siblings
+	// above it up to a section heading), in which case the heading.
+	function scrollTargetFor(active) {
+		for (var prev = active.previousElementSibling; prev; prev = prev.previousElementSibling) {
+			if (prev.classList.contains("step")) break;        // a step above â†’ keep the step as target
+			if (prev.classList.contains("section-title")) return prev;
+		}
+		return active;
+	}
+	function scrollCurrentToTop(main) {
+		var active = main.querySelector(".step.current");
+		if (!active) return;
+		var target = scrollTargetFor(active);
+		var mTop = main.getBoundingClientRect().top;
+		var tTop = target.getBoundingClientRect().top;
+		main.scrollTop += (tTop - mTop) - 12;
+	}
+
+	// Guide images load AFTER the list is rebuilt (lazy, no reserved height),
+	// so a step sitting below an image is first measured too high and we land
+	// above it. Re-align to the current step as each still-loading image
+	// settles â€” but only briefly after a completion, so a user scrolling
+	// through the guide later is never yanked back.
+	function realignOnImageLoad(main, curKey) {
+		var imgs = main.querySelectorAll(".guide-img img");
+		Array.prototype.forEach.call(imgs, function (im) {
+			if (im.complete) return;
+			function realign() {
+				im.removeEventListener("load", realign);
+				im.removeEventListener("error", realign);
+				if (lastScrolledKey === curKey && Date.now() <= alignDeadline) {
+					scrollCurrentToTop(main);
+				}
+			}
+			im.addEventListener("load", realign);
+			im.addEventListener("error", realign);
+		});
+	}
+
+	function renderSteps() {
+		var main = document.getElementById("steps");
+		// Clearing innerHTML drops scrollTop to 0, so remember where the user
+		// was and put them back on re-renders that don't advance the current
+		// step (ticking a sub-step, toggling an item, a background scan).
+		var prevScroll = main.scrollTop;
+		main.innerHTML = "";
+		var cur = currentStep();
+		var doneCount = 0;
+
+		guide.sections.forEach(function (section, si) {
+			main.appendChild(el("div", "section-title", section.title));
+			section.needed.forEach(function (n) {
+				main.appendChild(el("div", "section-needed", n));
+			});
+			(section.images || []).forEach(function (im) {
+				main.appendChild(guideImage(im));
+			});
+
+			section.steps.forEach(function (stepData, ti) {
+				var step = flatSteps.find(function (s) { return s.sectionIndex === si && s.stepIndex === ti; });
+				var done = isDone(step);
+				if (done) doneCount++;
+
+				var row = el("div", "step" + (done ? " done" : "") + (step === cur ? " current" : ""));
+				var box = document.createElement("input");
+				box.type = "checkbox";
+				box.checked = done;
+				box.tabIndex = -1;
+				row.appendChild(box);
+
+				var body = el("div", "step-text");
+				appendLinkedText(body, stepData.text, stepData.links);
+				if (stepData.chat) body.appendChild(el("span", "chip", "Chat: " + stepData.chat));
+				(stepData.maps || []).forEach(function (m) { body.appendChild(mapChip(m)); });
+				if (stepData.note) body.appendChild(el("span", "step-note", stepData.note));
+				(stepData.images || []).forEach(function (im) { body.appendChild(guideImage(im)); });
+				if (stepData.sub && stepData.sub.length) {
+					var ul = el("ul", "sub-list");
+					stepData.sub.forEach(function (item, k) {
+						var subDone = isSubDone(step, k);
+						var li = el("li", "sub-step" + (subDone ? " done" : ""));
+						var sbox = document.createElement("input");
+						sbox.type = "checkbox";
+						sbox.checked = subDone;
+						sbox.tabIndex = -1;
+						li.appendChild(sbox);
+						li.appendChild(document.createTextNode(" "));
+						appendLinkedText(li, item.text, item.links);
+						if (item.chat) li.appendChild(el("span", "chip", "Chat: " + item.chat));
+						(item.maps || []).forEach(function (m) { li.appendChild(mapChip(m)); });
+						li.addEventListener("click", function (e) {
+							e.stopPropagation();
+							setSubDone(step, k, !isSubDone(step, k));
+						});
+						ul.appendChild(li);
+					});
+					body.appendChild(ul);
+				}
+				row.appendChild(body);
+
+				row.addEventListener("click", function () {
+						var wasDone = isDone(step);
+						setDone(step, !wasDone);
+						if (!wasDone) maybeFinishQuest();
+					});
+				main.appendChild(row);
+			});
+		});
+
+		if (!cur && flatSteps.length) {
+			main.appendChild(el("div", "complete-banner", "Quest complete! " + guide.name + " is done."));
+			lastScrolledKey = null;
+		} else if (cur) {
+			// Scroll only when the current step actually changed (completing a
+			// step), not on every re-render (item toggles, scans). Top-align
+			// it with a little context above, so the current step and what
+			// follows are visible instead of the just-finished steps or a
+			// tall image landing mid-view.
+			var curKey = stepKey(cur);
+			if (curKey !== lastScrolledKey) {
+				lastScrolledKey = curKey;
+				alignDeadline = Date.now() + 2500;
+				scrollCurrentToTop(main);
+				realignOnImageLoad(main, curKey);
+			} else {
+				// Same current step: a sub-tick / item toggle / scan re-rendered
+				// the list. Don't yank the view â€” keep the user where they were,
+				// but keep correcting for images that are still loading if a
+				// completion just happened.
+				main.scrollTop = prevScroll;
+				if (Date.now() <= alignDeadline) realignOnImageLoad(main, curKey);
+			}
+		}
+
+		var total = flatSteps.length || 1;
+		document.getElementById("progress-fill").style.width = Math.round((doneCount / total) * 100) + "%";
+		document.getElementById("progress-label").textContent = doneCount + " / " + flatSteps.length;
+	}
+
+	// ---------- navigation ----------
+
+	// The overview = the three collapsible blocks above the steps. Each
+	// folds on its own via its summary; the button folds/unfolds them all.
+	var OVERVIEW_PANELS = ["items-panel", "details-items-panel", "details-rec-panel"];
+
+	function overviewButtonLabel() {
+		var anyOpen = OVERVIEW_PANELS.some(function (id) {
+			var p = document.getElementById(id);
+			return p.open && !p.classList.contains("hidden");
+		});
+		document.getElementById("btn-overview").textContent =
+			anyOpen ? "Collapse overview" : "Expand overview";
+		return anyOpen;
+	}
+
+	function resetOverview() {
+		OVERVIEW_PANELS.forEach(function (id) { document.getElementById(id).open = true; });
+		overviewButtonLabel();
+	}
+
+	function applyOverviewVisibility() {
+		var hidden = !!prefs.overviewHidden;
+		show("quest-meta", !hidden);
+		var btn = document.getElementById("btn-overview-visibility");
+		btn.textContent = hidden ? "Show overview" : "Hide overview";
+		btn.classList.toggle("active", hidden);
+	}
+
+	function renderQuestDetails() {
+		var d = (guide && guide.details) || { items: [], recommended: [] };
+		var itemsUl = document.getElementById("details-items");
+		var recUl = document.getElementById("details-rec");
+		itemsUl.innerHTML = "";
+		recUl.innerHTML = "";
+		d.items.forEach(function (line) {
+			// v10 cached strings are still safe to render; v11 entries retain
+			// their source bullet depth so alternatives stay visually grouped.
+			var l = typeof line === "string" ? line : line.text;
+			var depth = typeof line === "string" ? 0 : (line.depth || 0);
+			var li = el("li", null, l);
+			if (depth) li.style.marginLeft = (depth * 16) + "px";
+			// Surface the key annotation the quick guide leaves out.
+			if (/obtain(ed|able)?\s+(during|in)\s+the\s+quest/i.test(l)) li.className = "obtainable";
+			itemsUl.appendChild(li);
+		});
+		d.recommended.forEach(function (line) {
+			var l = typeof line === "string" ? line : line.text;
+			var depth = typeof line === "string" ? 0 : (line.depth || 0);
+			var li = el("li", null, l);
+			if (depth) li.style.marginLeft = (depth * 16) + "px";
+			recUl.appendChild(li);
+		});
+		// Each wiki section is its own collapsible block, so a huge
+		// overview (Rat Catchersâ€¦) can be folded away piece by piece.
+		show("details-items-panel", d.items.length > 0);
+		show("details-rec-panel", d.recommended.length > 0);
+		// The quest page's required-items list has now loaded â€” re-render the
+		// scanner list so items it omits get flagged "obtained during quest".
+		renderScanList();
+		// These panels are shown here, asynchronously, AFTER resetOverview set
+		// the button label â€” so re-sync it now that the real panels are up,
+		// otherwise it wrongly reads "Expand overview" while the overview is open.
+		overviewButtonLabel();
+	}
+
+	function openQuest(title) {
+		currentQuestTitle = title;
+		lastScrolledKey = null;
+		finishingQuest = false;
+		show("view-home", false);
+		show("view-guide", true);
+		document.getElementById("guide-title").textContent = guideDisplayName(title);
+		document.getElementById("steps").innerHTML = "";
+		document.getElementById("quest-info").innerHTML = "";
+		show("items-panel", false);
+		setStatus("guide-status", "Loading guide from the wikiâ€¦");
+
+		fetchGuide(title, function (parsed) {
+			guide = parsed;
+			flatSteps = [];
+			guide.sections.forEach(function (section, si) {
+				section.steps.forEach(function (stepData, ti) {
+					flatSteps.push({
+						sectionIndex: si,
+						stepIndex: ti,
+						text: stepData.text,
+						chat: stepData.chat,
+						subs: stepData.sub || []
+					});
+				});
+			});
+			setStatus("guide-status", flatSteps.length ? "" : "This guide has no parseable steps â€” use the wiki link above.");
+			renderMeta();
+			renderSteps();
+			show("details-items-panel", false);
+			show("details-rec-panel", false);
+			resetOverview();
+			applyOverviewVisibility();
+			attachQuestDetails(renderQuestDetails);
+			if (title !== PATHWAY_TITLE) attachFullGuideImages(guide.name, title);
+			restoreQuestingModes();
+			if (overlayTimer) paintOverlay();
+		}, function (msg) {
+			setStatus("guide-status", msg);
+		});
+	}
+
+	// Which questing modes the saved prefs say to turn back on. Auto implies
+	// Assist (Auto can't run without it). Pure, so it can be unit-tested.
+	function questingModesToRestore(prefsObj, autoOn) {
+		return {
+			overlay: !!(prefsObj && prefsObj.overlayOn),
+			assist: !!((prefsObj && prefsObj.assistOn) || autoOn)
+		};
+	}
+
+	// Re-apply the Overlay/Assist/Auto toggles the user last had on, once a
+	// guide is open. Silent â€” only turns things on when Alt1 actually
+	// supports them, so nothing pops errors on a normal browser. (Position
+	// and Auto are already persisted separately.)
+	function restoreQuestingModes() {
+		if (!inAlt1()) return;
+		var want = questingModesToRestore(prefs, autoAdvance);
+		if (want.overlay && alt1.permissionOverlay && !overlayTimer) setOverlay(true);
+		if (want.assist && assistAvailable() && !assistTimer) setAssist(true);
+	}
+
+	// Fetch the full walkthrough's images and merge them into the open
+	// quick guide by matching section headings (7-day cache). Best-effort:
+	// a failure or a quest whose headings don't line up just leaves the
+	// quick guide as-is.
+	function attachFullGuideImages(name, openedTitle) {
+		function merge(imgMap) {
+			// Guard against the user having navigated away meanwhile.
+			if (!guide || currentQuestTitle !== openedTitle || !Object.keys(imgMap).length) return;
+			var added = false;
+			var have = {};
+			guide.sections.forEach(function (sec) {
+				(sec.images || []).forEach(function (im) { have[im.file] = true; });
+				sec.steps.forEach(function (st) { (st.images || []).forEach(function (im) { have[im.file] = true; }); });
+			});
+			// Pass 1 â€” matching section headings: pin to a step by caption,
+			// else show for the section.
+			var usedHeading = {};
+			guide.sections.forEach(function (sec) {
+				var key = normHeading(sec.title);
+				var extra = imgMap[key];
+				if (!extra) return;
+				usedHeading[key] = true;
+				extra.forEach(function (im) {
+					if (have[im.file]) return;
+					have[im.file] = true;
+					var si = bestStepForCaption(im.caption, sec.steps);
+					if (si >= 0) sec.steps[si].images = (sec.steps[si].images || []).concat(im);
+					else sec.images = (sec.images || []).concat(im);
+					added = true;
+				});
+			});
+			// Pass 2 â€” the quick and full guides sometimes name sections
+			// differently (One Piercing Note, Swept Away). For images whose
+			// heading never matched, fall back to the best step ANYWHERE in
+			// the guide by caption overlap; drop the image if nothing fits
+			// (better absent than on the wrong step).
+			var allSteps = [];
+			guide.sections.forEach(function (sec) { sec.steps.forEach(function (st) { allSteps.push(st); }); });
+			Object.keys(imgMap).forEach(function (key) {
+				if (usedHeading[key]) return;
+				imgMap[key].forEach(function (im) {
+					if (have[im.file]) return;
+					var si = bestStepForCaption(im.caption, allSteps);
+					if (si >= 0) {
+						have[im.file] = true;
+						allSteps[si].images = (allSteps[si].images || []).concat(im);
+						added = true;
+					}
+				});
+			});
+			if (added) { renderSteps(); if (overlayTimer) paintOverlay(); }
+		}
+		var cache = load(FULLIMG_CACHE_KEY, {});
+		var hit = cache[name];
+		if (hit && Date.now() - hit.ts < FULLIMG_TTL_MS) { merge(hit.data); return; }
+		wikiGet({ action: "parse", page: name, prop: "wikitext" }, function (data) {
+			var imgs = {};
+			try { imgs = parseFullGuideImages(data.parse.wikitext["*"]); } catch (e) { /* ignore */ }
+			cache[name] = { ts: Date.now(), data: imgs };
+			try { store(FULLIMG_CACHE_KEY, cache); } catch (e) { /* quota */ }
+			merge(imgs);
+		}, function () { /* full guide unavailable â€” quick guide stands alone */ });
+	}
+
+	function goHome() {
+		guide = null;
+		flatSteps = [];
+		setOverlay(false);
+		setAssist(false);
+		hideMapPanel();
+		show("view-guide", false);
+		show("view-home", true);
+		renderList();
+		document.getElementById("search").focus();
+	}
+
+	// ---------- wiring ----------
+
+	function applyRmStatuses(parsed, name, how) {
+		rmStatuses = parsed.statuses;
+		rmEligible = parsed.eligible || null;
+		var done = 0;
+		Object.keys(rmStatuses).forEach(function (k) { if (rmStatuses[k] === "COMPLETED") done++; });
+		setStatus("sync-status", (how || "Synced") + ": " + done + " quests completed on " + name + ".");
+		show("rm-import", false);
+		renderList();
+	}
+
+	function syncRuneMetrics(force) {
+		var name = document.getElementById("rsn").value.trim();
+		if (!name) {
+			setStatus("sync-status", "Enter your RuneScape name first.");
+			return;
+		}
+		prefs.rsn = name;
+		store(PREFS_KEY, prefs);
+		setStatus("sync-status", "Fetching quest statuses for " + name + "â€¦");
+		fetchRuneMetrics(name, force, function (parsed) {
+			applyRmStatuses(parsed, name);
+		}, function (msg) {
+			setStatus("sync-status", msg);
+			// Offer the always-works manual path.
+			document.getElementById("rm-open").href = RM_URL + encodeURIComponent(name);
+			show("rm-import", true);
+		});
+	}
+
+	// Startup sync: refresh quest completion for the saved name without
+	// any clicking. Best-effort â€” on failure keep the cached statuses and
+	// stay quiet instead of popping the manual-import panel (the Sync
+	// button still offers that path).
+	function autoSyncRuneMetrics() {
+		var name = (prefs.rsn || "").trim();
+		if (!name) return;
+		setStatus("sync-status", "Syncing quest statuses for " + name + "â€¦");
+		fetchRuneMetrics(name, false, function (parsed) {
+			applyRmStatuses(parsed, name, "Auto-synced");
+		}, function () {
+			setStatus("sync-status", rmStatuses
+				? "Auto-sync failed â€” showing the last synced quest statuses."
+				: "Auto-sync failed â€” click Sync to retry or import manually.");
+		});
+	}
+
+	function loadOptimalOrder() {
+		if (optimalRank) { renderList(); return; }
+		setStatus("sync-status", "Loading optimal quest order from the wikiâ€¦");
+		fetchOptimalOrder(function (rank) {
+			optimalRank = rank;
+			setStatus("sync-status", "");
+			renderList();
+		}, function (msg) {
+			setStatus("sync-status", msg);
+			prefs.sort = "az";
+			document.getElementById("sort-mode").value = "az";
+			store(PREFS_KEY, prefs);
+		});
+	}
+
+	function loadTimelineOrder() {
+		if (timelineRank) { renderList(); return; }
+		setStatus("sync-status", "Loading the timeline quest order from the wikiâ€¦");
+		fetchTimelineOrder(function (rank) {
+			timelineRank = rank;
+			setStatus("sync-status", "");
+			renderList();
+		}, function (msg) {
+			setStatus("sync-status", msg);
+			prefs.sort = "az";
+			document.getElementById("sort-mode").value = "az";
+			store(PREFS_KEY, prefs);
+		});
+	}
+
+	// Kick off whichever rank data the current sort mode needs.
+	function loadSortData() {
+		if (prefs.sort === "optimal") loadOptimalOrder();
+		else if (prefs.sort === "timeline") loadTimelineOrder();
+		else renderList();
+	}
+
+	function init() {
+		applyTheme();
+		applyAppTextScale();
+		document.getElementById("search").addEventListener("input", renderList);
+		document.getElementById("btn-home").addEventListener("click", goHome);
+
+		var rsnInput = document.getElementById("rsn");
+		var hideDone = document.getElementById("hide-done");
+		var eligibleOnly = document.getElementById("eligible-only");
+		var sortMode = document.getElementById("sort-mode");
+		rsnInput.value = prefs.rsn || "";
+		hideDone.checked = !!prefs.hideDone;
+		eligibleOnly.checked = !!prefs.eligibleOnly;
+		sortMode.value = prefs.sort || "az";
+
+		document.getElementById("btn-sync").addEventListener("click", function () { syncRuneMetrics(true); });
+		rsnInput.addEventListener("keydown", function (e) {
+			if (e.key === "Enter") syncRuneMetrics(true);
+		});
+		document.getElementById("btn-rm-import").addEventListener("click", function () {
+			var name = rsnInput.value.trim() || prefs.rsn || "manual import";
+			var parsed = parseRmPayload(document.getElementById("rm-json").value.trim());
+			if (!parsed) {
+				setStatus("sync-status", "That text does not look like RuneMetrics quest data â€” copy the whole page, starting with {\"quests\":[");
+				return;
+			}
+			store(RM_CACHE_KEY, { ts: Date.now(), name: name,
+				statuses: parsed.statuses, eligible: parsed.eligible });
+			document.getElementById("rm-json").value = "";
+			applyRmStatuses(parsed, name, "Imported");
+		});
+		document.getElementById("btn-rm-cancel").addEventListener("click", function () {
+			show("rm-import", false);
+		});
+		hideDone.addEventListener("change", function () {
+			prefs.hideDone = hideDone.checked;
+			store(PREFS_KEY, prefs);
+			renderList();
+		});
+		eligibleOnly.addEventListener("change", function () {
+			prefs.eligibleOnly = eligibleOnly.checked;
+			store(PREFS_KEY, prefs);
+			renderList();
+		});
+		sortMode.addEventListener("change", function () {
+			prefs.sort = sortMode.value;
+			store(PREFS_KEY, prefs);
+			loadSortData();
+		});
+
+		// Settings popup: every configurable option in one place, opened
+		// from the gear button in either view.
+		var settingsPopup = document.getElementById("settings-popup");
+		["btn-settings-home", "btn-settings-guide"].forEach(function (id) {
+			document.getElementById(id).addEventListener("click", function () {
+				settingsPopup.classList.remove("hidden");
+			});
+		});
+		document.getElementById("settings-close").addEventListener("click", function () {
+			settingsPopup.classList.add("hidden");
+		});
+		settingsPopup.addEventListener("click", function (e) {
+			if (e.target === this) this.classList.add("hidden");
+		});
+
+		var floorMode = document.getElementById("floor-mode");
+		floorMode.value = floorPref();
+		floorMode.addEventListener("change", function () {
+			prefs.floors = floorMode.value;
+			store(PREFS_KEY, prefs);
+			// Cached guides were parsed with the old wording â€” drop them so
+			// the next open re-parses, and re-open the current one live.
+			try { localStorage.removeItem(GUIDE_CACHE_KEY); } catch (e) { /* ignore */ }
+			if (currentQuestTitle && !document.getElementById("view-guide").classList.contains("hidden")) {
+				openQuest(currentQuestTitle);
+			}
+		});
+
+		var themeMode = document.getElementById("theme-mode");
+		themeMode.value = prefs.theme || "dark";
+		themeMode.addEventListener("change", function () {
+			prefs.theme = themeMode.value;
+			store(PREFS_KEY, prefs);
+			applyTheme();
+		});
+
+		var overlayBg = document.getElementById("overlay-bg");
+		overlayBg.value = overlayBgOff() ? "off" : "solid";
+		overlayBg.addEventListener("change", function () {
+			prefs.overlayBg = overlayBg.value;
+			store(PREFS_KEY, prefs);
+			if (overlayTimer) paintOverlay();
+		});
+
+		[
+			{ id: "overlay-size", pref: "overlayScale", min: 100, max: 200,
+				apply: function () { if (overlayTimer) paintOverlay(); } },
+			{ id: "app-size", pref: "guideScale", min: 80, max: 160,
+				apply: applyAppTextScale }
+		].forEach(function (cfg) {
+			var value = document.getElementById(cfg.id + "-value");
+			var input = document.getElementById(cfg.id);
+			function refreshSize() {
+				var pct = sizePercent(prefs[cfg.pref], 100, cfg.min, cfg.max);
+				input.value = pct;
+				value.textContent = pct + "%";
+			}
+			refreshSize();
+			input.addEventListener("input", function () {
+				prefs[cfg.pref] = sizePercent(input.value, 100, cfg.min, cfg.max);
+				store(PREFS_KEY, prefs);
+				refreshSize();
+				cfg.apply();
+			});
+		});
+
+		document.getElementById("btn-overview").addEventListener("click", function () {
+			var anyOpen = overviewButtonLabel();
+			OVERVIEW_PANELS.forEach(function (id) {
+				document.getElementById(id).open = !anyOpen;
+			});
+			overviewButtonLabel();
+		});
+		document.getElementById("btn-overview-visibility").addEventListener("click", function () {
+			prefs.overviewHidden = !prefs.overviewHidden;
+			store(PREFS_KEY, prefs);
+			applyOverviewVisibility();
+		});
+		// Folding a single section by its summary keeps the button honest.
+		OVERVIEW_PANELS.forEach(function (id) {
+			document.getElementById(id).addEventListener("toggle", overviewButtonLabel);
+		});
+
+		document.getElementById("btn-clear-cache").addEventListener("click", function () {
+			[INDEX_CACHE_KEY, GUIDE_CACHE_KEY, ORDER_CACHE_KEY, TIMELINE_CACHE_KEY].forEach(function (k) {
+				try { localStorage.removeItem(k); } catch (e) { /* ignore */ }
+			});
+			location.reload();
+		});
+
+		var progressCode = document.getElementById("progress-code");
+		var progressSyncStatus = document.getElementById("progress-sync-status");
+		document.getElementById("btn-progress-export").addEventListener("click", function () {
+			var questCount = Object.keys(progress).length;
+			progressCode.value = encodeProgress(progress);
+			progressCode.focus();
+			progressCode.select();
+			try { document.execCommand("copy"); } catch (e) { /* selection is enough */ }
+			progressSyncStatus.textContent = "Code for " + questCount + " quest" + (questCount === 1 ? "" : "s") +
+				" copied â€” paste it into the app on your other browser or device.";
+		});
+		document.getElementById("btn-progress-import").addEventListener("click", function () {
+			var decoded = decodeProgress(progressCode.value);
+			if (!decoded) {
+				progressSyncStatus.textContent = "That does not look like a progress code â€” it should start with \"" + PROGRESS_CODE_PREFIX + "\".";
+				return;
+			}
+			var changed = mergeProgress(progress, decoded);
+			store(PROGRESS_KEY, progress);
+			progressCode.value = "";
+			renderList();
+			if (guide) renderSteps();
+			if (overlayTimer) paintOverlay();
+			progressSyncStatus.textContent = changed > 0
+				? "Imported â€” progress merged for " + changed + " quest" + (changed === 1 ? "" : "s") + "."
+				: "Imported â€” your progress already covered everything in that code.";
+		});
+
+		document.getElementById("btn-next").addEventListener("click", function () { advanceStep(false); });
+
+		// "Done, next" from inside the game: Alt1's main hotkey (Alt+1 by
+		// default, configurable in Alt1's settings) advances the step, so the
+		// overlay alone is enough to quest by. This is the only key that works
+		// while the game window is focused â€” a web app can't capture keys
+		// otherwise, which is why there's no in-app key binding.
+		if (inAlt1() && typeof A1lib.on === "function") {
+			A1lib.on("alt1pressed", function () { advanceStep(true); });
+		}
+
+		document.getElementById("btn-back").addEventListener("click", function () {
+			for (var i = flatSteps.length - 1; i >= 0; i--) {
+				if (isDone(flatSteps[i])) { setDone(flatSteps[i], false); break; }
+			}
+		});
+
+		// Completion can be recorded when the player has finished a quest
+		// outside the helper. Use the same two-click guard as Reset.
+		var completeBtn = document.getElementById("btn-complete");
+		var completeArmed = false, completeTimer = null;
+		function disarmComplete() {
+			completeArmed = false;
+			completeBtn.textContent = "Mark complete";
+			completeBtn.classList.remove("active");
+			if (completeTimer) { clearTimeout(completeTimer); completeTimer = null; }
+		}
+		completeBtn.addEventListener("click", function () {
+			if (!guide) return;
+			if (!completeArmed) {
+				completeArmed = true;
+				completeBtn.textContent = "Complete? Click again";
+				completeBtn.classList.add("active");
+				completeTimer = setTimeout(disarmComplete, 3000);
+				return;
+			}
+			disarmComplete();
+			markQuestComplete();
+			maybeFinishQuest();
+		});
+
+		// Two-click confirm instead of confirm(): Alt1's embedded browser
+		// blocks native dialogs, so confirm() returned false and Reset
+		// silently did nothing. First click arms; second within 3s clears.
+		var resetBtn = document.getElementById("btn-reset");
+		var resetArmed = false, resetTimer = null;
+		function disarmReset() {
+			resetArmed = false;
+			resetBtn.textContent = "Reset";
+			resetBtn.classList.remove("active");
+			if (resetTimer) { clearTimeout(resetTimer); resetTimer = null; }
+		}
+		resetBtn.addEventListener("click", function () {
+			if (!guide) return;
+			if (!resetArmed) {
+				resetArmed = true;
+				resetBtn.textContent = "Reset? Click again";
+				resetBtn.classList.add("active");
+				resetTimer = setTimeout(disarmReset, 3000);
+				return;
+			}
+			disarmReset();
+			progress[guide.title] = { done: {}, items: {} };
+			store(PROGRESS_KEY, progress);
+			renderSteps();
+			renderMeta();
+			if (overlayTimer) paintOverlay();
+			setStatus("guide-status", "Progress cleared for " + guide.name + ".");
+			setTimeout(function () { setStatus("guide-status", ""); }, 2500);
+		});
+
+		// Native alert() is blocked in Alt1's browser too, so surface these
+		// in the guide status line where the user can actually read them.
+		function notify(msg) {
+			setStatus("guide-status", msg);
+			setTimeout(function () { setStatus("guide-status", ""); }, 5000);
+		}
+
+		document.getElementById("btn-overlay").addEventListener("click", function () {
+			if (!inAlt1()) {
+				notify("The overlay only works inside Alt1.");
+				return;
+			}
+			if (!alt1.permissionOverlay) {
+				notify("Overlay permission is not granted. Re-add the app or enable it in Alt1 settings.");
+				return;
+			}
+			setOverlay(!overlayTimer);
+			// Remember the choice so it comes back next session (only saved on
+			// a deliberate click, not when goHome turns it off on exit).
+			prefs.overlayOn = !!overlayTimer;
+			store(PREFS_KEY, prefs);
+		});
+
+		document.getElementById("btn-assist").addEventListener("click", function () {
+			if (!inAlt1()) {
+				notify("Assist only works inside Alt1.");
+				return;
+			}
+			if (!assistAvailable()) {
+				notify("Assist needs the pixel and overlay permissions. Re-add the app (the permission request changed) or enable them in Alt1's app settings.");
+				return;
+			}
+			setAssist(!assistTimer);
+			prefs.assistOn = !!assistTimer;
+			store(PREFS_KEY, prefs);
+			// Turning Assist off also stops Auto (it depends on Assist).
+			if (!assistTimer && autoAdvance) { autoAdvance = false; store(AUTO_KEY, false); refreshAutoBtn(); }
+		});
+
+		var autoBtn = document.getElementById("btn-auto");
+		function refreshAutoBtn() {
+			autoBtn.textContent = "Auto: " + (autoAdvance ? "on" : "off");
+			autoBtn.classList.toggle("active", autoAdvance);
+		}
+		autoBtn.addEventListener("click", function () {
+			if (!autoAdvance) {
+				if (!inAlt1()) { notify("Auto-tick only works inside Alt1."); return; }
+				if (!assistAvailable()) { notify("Auto-tick needs the pixel and overlay permissions."); return; }
+				autoAdvance = true;
+				if (!assistTimer) setAssist(true);
+			} else {
+				autoAdvance = false;
+			}
+			store(AUTO_KEY, autoAdvance);
+			refreshAutoBtn();
+		});
+		refreshAutoBtn();
+
+		document.getElementById("map-close").addEventListener("click", hideMapPanel);
+		document.getElementById("btn-scan").addEventListener("click", scanBackpack);
+		document.getElementById("item-popup-close").addEventListener("click", function () {
+			document.getElementById("item-popup").classList.add("hidden");
+		});
+		document.getElementById("item-popup").addEventListener("click", function (e) {
+			if (e.target === this) this.classList.add("hidden");
+		});
+
+		var overlayPos = document.getElementById("overlay-pos");
+		var freePanel = document.getElementById("free-pos");
+		var freeBox = document.getElementById("free-pos-box");
+		var freeDot = document.getElementById("free-pos-dot");
+
+		function refreshFreeDot() {
+			freeDot.style.left = ((prefs.overlayFreeX === undefined ? 0.5 : prefs.overlayFreeX) * 100) + "%";
+			freeDot.style.top = ((prefs.overlayFreeY === undefined ? 0.05 : prefs.overlayFreeY) * 100) + "%";
+		}
+
+		function placeFree(e) {
+			var r = freeBox.getBoundingClientRect();
+			prefs.overlayFreeX = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+			prefs.overlayFreeY = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+			store(PREFS_KEY, prefs);
+			refreshFreeDot();
+			if (overlayTimer) paintOverlay();
+		}
+
+		var freeDragging = false;
+		var freeHideTimer = null;
+		freeBox.addEventListener("mousedown", function (e) {
+			freeDragging = true;
+			if (freeHideTimer) { clearTimeout(freeHideTimer); freeHideTimer = null; }
+			placeFree(e);
+		});
+		window.addEventListener("mousemove", function (e) { if (freeDragging) placeFree(e); });
+		window.addEventListener("mouseup", function () {
+			if (!freeDragging) return;
+			freeDragging = false;
+			// Placement done â€” tuck the box away shortly after.
+			freeHideTimer = setTimeout(function () { show("free-pos", false); }, 1200);
+		});
+
+		function openFreePanel(open) {
+			if (open && freeHideTimer) { clearTimeout(freeHideTimer); freeHideTimer = null; }
+			show("free-pos", open);
+		}
+
+		overlayPos.value = prefs.overlayPos || "tc";
+		// On startup a saved free position is already in effect â€” keep the
+		// placement box closed. Only auto-open it when "free" is selected
+		// but no spot was ever picked (first use).
+		openFreePanel(overlayPos.value === "free" && prefs.overlayFreeX === undefined);
+		refreshFreeDot();
+		overlayPos.addEventListener("change", function () {
+			prefs.overlayPos = overlayPos.value;
+			store(PREFS_KEY, prefs);
+			openFreePanel(overlayPos.value === "free");
+			if (overlayTimer) paintOverlay();
+		});
+		// Re-open the placement box by clicking the dropdown while "Freeâ€¦"
+		// is already selected.
+		overlayPos.addEventListener("click", function () {
+			if (overlayPos.value === "free") openFreePanel(true);
+		});
+
+		if (inAlt1()) {
+			alt1.identifyAppUrl("./appconfig.json");
+			// Wipe our overlays the moment the app window closes; painted
+			// overlays would otherwise linger until their timer expires.
+			window.addEventListener("unload", function () {
+				clearOverlay();
+				clearAssistOverlay();
+			});
+		} else {
+			var banner = document.getElementById("alt1-banner");
+			banner.classList.remove("hidden");
+			document.getElementById("addtoalt1").href =
+				"alt1://addapp/" + new URL("appconfig.json", location.href).href;
+		}
+
+		setStatus("index-status", "Loading quest list from the wikiâ€¦");
+		fetchQuestIndex(function (list) {
+			questIndex = list;
+			setStatus("index-status", "");
+			// Restore cached RuneMetrics statuses and preferred sort, then
+			// refresh the statuses automatically for the saved name.
+			var rmCached = load(RM_CACHE_KEY, null);
+			if (rmCached && rmCached.name === prefs.rsn) {
+				rmStatuses = rmCached.statuses;
+				rmEligible = rmCached.eligible || null;
+			}
+			loadSortData();
+			renderList();
+			autoSyncRuneMetrics();
+
+			// Deep link (?quest=Title) â€” also used for automated testing.
+			var qp = /[?&]quest=([^&]+)/.exec(location.search);
+			if (qp) {
+				var name = decodeURIComponent(qp[1].replace(/\+/g, " "));
+				var match = null;
+				questIndex.forEach(function (q) {
+					if (q.name.toLowerCase() === name.toLowerCase() || q.title.toLowerCase() === name.toLowerCase()) match = q;
+				});
+				if (match) openQuest(match.title);
+				else if (name.toLowerCase() === PATHWAY_TITLE.toLowerCase() || /^pathway$/i.test(name)) openQuest(PATHWAY_TITLE);
+			}
+		}, function (msg) {
+			setStatus("index-status", msg + " â€” check your connection and reload.");
+		});
+	}
+
+	// Debug/test hook (also handy in Alt1's dev console).
+	window.__rs3qh = {
+		matchOptions: matchOptions,
+		parseQuickGuide: parseQuickGuide,
+		convoObserve: convoObserve,
+		countMatchedCandidates: countMatchedCandidates,
+		requiredConversations: requiredConversations,
+		lastMatchableCand: lastMatchableCand,
+		matchedCandIndex: matchedCandIndex,
+		sizePercent: sizePercent,
+		scrollTargetFor: scrollTargetFor,
+		encodeProgress: encodeProgress,
+		decodeProgress: decodeProgress,
+		mergeProgress: mergeProgress,
+		questingModesToRestore: questingModesToRestore,
+		assistTargets: assistTargets,
+		npcNamesForText: npcNamesForText,
+		dialogTitleConflicts: dialogTitleConflicts,
+		autoTickBlockedBySubs: autoTickBlockedBySubs,
+		normName: normName,
+		parseRmPayload: parseRmPayload,
+		canDoNow: canDoNow,
+		testOverlayCard: function (withSubs) {
+			var gsave = guide, fsave = flatSteps, testTitle = "__rs3qh_overlay_test__";
+			var savedProgress = progress[testTitle];
+			guide = { name: "Test Quest", title: testTitle, sections: [{ needed: [] }] };
+			flatSteps = [
+				{ text: "Talk to the very important test NPC in a place with quite a long description that should wrap onto several lines nicely.", chat: "1 Yes please. / Any",
+					subs: withSubs ? [
+						{ text: "Collect the first test item." }, { text: "Talk to the test guard.", chat: "1 Hello." },
+						{ text: "Use the test lever." }
+					] : [] },
+				{ text: "Then do the next thing." }
+			];
+			var img;
+			try {
+				img = renderOverlayCard(flatSteps[0], 0, 2);
+			} finally {
+				guide = gsave;
+				flatSteps = fsave;
+				if (savedProgress === undefined) delete progress[testTitle];
+				else progress[testTitle] = savedProgress;
+			}
+			return img;
+		},
+		parseQuestDetails: parseQuestDetails,
+		parseRecipe: parseRecipe,
+		parseShopRows: parseShopRows,
+		questLockNote: questLockNote,
+		locationLockNote: locationLockNote,
+		fetchRuneMetrics: fetchRuneMetrics,
+		parsePathwayGuide: parsePathwayGuide,
+		parseFullGuideImages: parseFullGuideImages,
+		bestStepForCaption: bestStepForCaption,
+		floorText: floorText,
+		floorPrefForLocale: floorPrefForLocale,
+		setFloorPref: function (v) { prefs.floors = v; },
+		setOverlayScale: function (v) { prefs.overlayScale = v; },
+		setOverlayBg: function (v) { prefs.overlayBg = v; },
+		// Simulate an Alt+1 press (advanceStep with the hotkey flag) on a
+		// two-step guide and report the current step before/after, so the
+		// hotkey->advance path is testable headless (Alt1's actual event
+		// delivery can't be, but everything after it can).
+		testAlt1Advance: function () {
+			var gsave = guide, fsave = flatSteps, testTitle = "__rs3qh_advance_test__";
+			var savedProgress = progress[testTitle];
+			var gv = document.getElementById("view-guide");
+			var wasHidden = gv && gv.classList.contains("hidden");
+			if (gv) gv.classList.remove("hidden");
+			guide = { name: "Advance Test", title: testTitle, sections: [] };
+			flatSteps = [
+				{ text: "First", sectionIndex: 0, stepIndex: 0 },
+				{ text: "Second", sectionIndex: 0, stepIndex: 1 }
+			];
+			var before = currentStep();
+			var got = advanceStep(true);
+			var after = currentStep();
+			guide = gsave; flatSteps = fsave;
+			if (gv && wasHidden) gv.classList.add("hidden");
+			if (savedProgress === undefined) delete progress[testTitle];
+			else progress[testTitle] = savedProgress;
+			store(PROGRESS_KEY, progress);
+			return { advanced: got, before: before && before.text, after: after && after.text };
+		},
+		parseTimelineOrder: parseTimelineOrder,
+		fetchTimelineOrder: fetchTimelineOrder,
+		overlaySubRows: overlaySubRows,
+		highlightShapes: highlightShapes,
+		allOptionsMatched: allOptionsMatched,
+		measureOptionButton: measureOptionButton,
+		scaleHintText: scaleHintText,
+		subCascadeAllowed: subCascadeAllowed,
+		// Stateful dialogue-screen helpers for regression tests.
+		optionScreenState: function (key, opts, optionKey) {
+			return { index: screenIndexFor(key, opts), candidateStart: optScreen.nextCand[optionKey] || 0 };
+		},
+		recordOptionMatch: function (optionKey, candidateIndex) {
+			optScreen.matchedTarget = optionKey;
+			optScreen.matchedCand = candidateIndex;
+		},
+		resetOptionScreens: function () {
+			optScreen.key = null; optScreen.sig = null; optScreen.idx = 0; optScreen.gone = 0;
+			optScreen.optionsGone = 0; optScreen.nextCand = {}; optScreen.matchedCand = -1; optScreen.matchedTarget = null;
+		},
+		optionScreenNoOptions: screenIndexNoOptions,
+		setAuto: function (v) { autoAdvance = v; }
+	};
+
+	init();
+})();
+
+
+
