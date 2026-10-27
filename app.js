@@ -1647,9 +1647,10 @@
 	function dialogTitleConflicts(target, title) {
 		var names = (target && target.npcNames) || [];
 		var got = normNpcName(title);
-		// DialogReader returns "choose an option" on some skins; that is not
+		// DialogReader returns generic option prompts on some skins; that is not
 		// an NPC identity, so preserve Auto's normal behaviour in that case.
-		if (!names.length || !got || /choose|option/.test(got)) return false;
+		if (!names.length || !got || /choose|option/.test(got) ||
+			/^(?:what )?would you like to (?:say|do)$/.test(got)) return false;
 		return !names.some(function (name) {
 			var want = normNpcName(name);
 			return want && (want === got || want.indexOf(got) !== -1 || got.indexOf(want) !== -1);
