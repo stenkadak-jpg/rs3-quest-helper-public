@@ -1569,7 +1569,7 @@
 	// Changes to the options list advance one screen; a new guide step
 	// resets every queue pointer.
 	function screenIndexFor(key, opts) {
-		var sig = opts.map(function (o) { return o.text || ""; }).join("|");
+		var sig = opts.map(function (o) { return normOpt(o.text || ""); }).join("|");
 		if (optScreen.key !== key) {
 			optScreen.key = key; optScreen.sig = sig; optScreen.idx = 0;
 			optScreen.nextCand = {}; optScreen.matchedCand = -1; optScreen.matchedTarget = null;
@@ -1600,9 +1600,9 @@
 	function screenIndexGone() {
 		if (optScreen.key === null) return;
 		optScreen.gone++;
-		// A missing frame is a no-options screen, too; previously we only
-		// called screenIndexNoOptions() for readable NPC response text.
-		screenIndexNoOptions();
+		// Missing frames may be capture or detection failures.
+		// Missing capture is not evidence of a selected option.
+		optScreen.optionsGone = 0;
 		// Do NOT reset optScreen.key/nextCand here. NPC replies, cutscenes,
 		// and quest-offer windows can hide the dialogue for multiple ticks.
 		// The next guide step or toggling Assist resets the state instead.
@@ -1766,12 +1766,13 @@
 		// optTextScore still only matches it EXACTLY, so it lands on its own
 		// screen and stays silent elsewhere (never a stray position match).
 		if (!textPart.length) return null;
-		var best = null, bestScore = 0, bestIdx = -1;
+		var best = null, bestScore = 0, bestIdx = -1, tied = false;
 		opts.forEach(function (o, i) {
 			var s = optTextScore(textPart, normOpt(o.text || ""));
-			if (s > bestScore) { bestScore = s; best = o; bestIdx = i; }
+			if (s > bestScore) { bestScore = s; best = o; bestIdx = i; tied = false; }
+			else if (s > 0 && s === bestScore) { tied = true; }
 		});
-		if (!best) return null;
+		if (!best || tied) return null;
 		// The number is the option's position on its screen â€” enforced so a
 		// chain's text candidate can't grab the same word at a different
 		// position on another screen. ignoreNumber lifts this for a single-pick
@@ -1812,7 +1813,8 @@
 			if (text.length < 3 || textCount[text] !== 1) continue;
 			for (var oi = 0; oi < opts.length; oi++) {
 				var s = optTextScore(text, normOpt(opts[oi].text || ""));
-				if (s >= 1 && (num === null || oi + 1 === num) && s > bestScore) {
+				if (s >= 1 && (num === null || oi + 1 === num) && s > bestScore &&
+					bestOptionFor(cands[ci], opts) === opts[oi]) {
 					bestScore = s; best = opts[oi]; bestCi = ci;
 				}
 			}
